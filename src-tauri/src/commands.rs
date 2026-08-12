@@ -165,8 +165,47 @@ pub async fn preview_media(
             .artifact_dir
             .ok_or_else(|| AppError::Media("请先完成媒体准备".into()))?,
     );
+    tauri::async_runtime::spawn_blocking(move || crate::media::resolve_preview(&artifact_dir))
+        .await
+        .map_err(|error| AppError::Media(error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn preview_prepare(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<crate::domain::PreviewMedia, AppError> {
+    let preview_lock = state
+        .preview_locks
+        .lock()
+        .expect("preview lock registry mutex poisoned")
+        .entry(project_id.clone())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone();
+    let project = state
+        .database
+        .lock()
+        .expect("database mutex poisoned")
+        .get_project(&project_id)?;
+    let artifact_dir = PathBuf::from(
+        project
+            .artifact_dir
+            .ok_or_else(|| AppError::Media("请先完成媒体准备".into()))?,
+    );
     tauri::async_runtime::spawn_blocking(move || {
-        crate::media::resolve_preview(&artifact_dir, &project.audio_mode)
+        let _guard = preview_lock.lock().expect("project preview mutex poisoned");
+        let path = crate::media::render_dubbed_preview(&artifact_dir, &project.audio_mode)?;
+        Ok(crate::domain::PreviewMedia {
+            path: path.to_string_lossy().into_owned(),
+            dubbed: true,
+            revision: path
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or_default(),
+        })
     })
     .await
     .map_err(|error| AppError::Media(error.to_string()))?
@@ -309,20 +348,11 @@ pub fn segment_list(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<Vec<SegmentRecord>, AppError> {
-    let database = state.database.lock().expect("database mutex poisoned");
-    let project = database.get_project(&project_id)?;
-    let segments = database.list_segments(&project_id)?;
-    if project.progress >= 80 {
-        if let Some(directory) = project.artifact_dir {
-            let warning_ids = crate::tts::audit_warnings(&segments, &PathBuf::from(directory));
-            database.set_project_segments_status(&project_id, "warning", "ready")?;
-            for id in warning_ids {
-                database.set_segment_status(&id, "warning")?;
-            }
-            return database.list_segments(&project_id);
-        }
-    }
-    Ok(segments)
+    state
+        .database
+        .lock()
+        .expect("database mutex poisoned")
+        .list_segments(&project_id)
 }
 
 #[tauri::command]
@@ -629,29 +659,30 @@ pub async fn tts_run(
     let progress_app = app.clone();
     let progress_job_id = job_id.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let output = crate::tts::synthesize(&segments, &artifact_dir, duration_ms, |done, total| {
-            if done == total || done % 4 == 0 {
-                let managed_state = progress_app.state::<AppState>();
-                let database = managed_state
-                    .database
-                    .lock()
-                    .expect("database mutex poisoned");
-                let percent = 57 + (done * 22 / total.max(1)) as u8;
-                if database
-                    .checkpoint_job(
-                        &progress_job_id,
-                        "tts",
-                        percent,
-                        &format!("tts:segment-{done}/{total}"),
-                    )
-                    .is_ok()
-                {
-                    if let Ok(job) = database.get_job(&progress_job_id) {
-                        emit_job_state(&progress_app, &job);
+        let output =
+            crate::tts::synthesize(&segments, &artifact_dir, duration_ms, |done, total| {
+                if done == total || done % 4 == 0 {
+                    let managed_state = progress_app.state::<AppState>();
+                    let database = managed_state
+                        .database
+                        .lock()
+                        .expect("database mutex poisoned");
+                    let percent = 57 + (done * 22 / total.max(1)) as u8;
+                    if database
+                        .checkpoint_job(
+                            &progress_job_id,
+                            "tts",
+                            percent,
+                            &format!("tts:segment-{done}/{total}"),
+                        )
+                        .is_ok()
+                    {
+                        if let Ok(job) = database.get_job(&progress_job_id) {
+                            emit_job_state(&progress_app, &job);
+                        }
                     }
                 }
-            }
-        })?;
+            })?;
         crate::media::render_dubbed_preview(&artifact_dir, &audio_mode)?;
         Ok::<_, AppError>(output)
     })

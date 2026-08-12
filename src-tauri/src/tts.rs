@@ -11,21 +11,6 @@ pub struct TtsOutput {
     pub warning_ids: Vec<String>,
 }
 
-pub fn audit_warnings(segments: &[SegmentRecord], artifact_dir: &Path) -> Vec<String> {
-    let tts_dir = artifact_dir.join("tts");
-    segments
-        .iter()
-        .filter_map(|segment| {
-            let cache_key = spoken_cache_key(segment);
-            let current = tts_dir.join(format!("{}-{cache_key}.wav", segment.id));
-            let legacy = tts_dir.join(format!("{}.wav", segment.id));
-            let path = if current.is_file() { current } else { legacy };
-            let actual_ms = duration_ms_of(&path).ok()?;
-            (actual_ms > segment.end_ms - segment.start_ms + 150).then(|| segment.id.clone())
-        })
-        .collect()
-}
-
 pub fn synthesize(
     segments: &[SegmentRecord],
     artifact_dir: &Path,
@@ -242,11 +227,5 @@ mod tests {
         let mut second = first.clone();
         second.spoken_zh.push_str("新的内容");
         assert_ne!(spoken_cache_key(&first), spoken_cache_key(&second));
-    }
-
-    #[test]
-    fn audit_ignores_missing_cached_audio() {
-        let root = std::env::temp_dir().join(format!("yisheng-audit-{}", uuid::Uuid::new_v4()));
-        assert!(audit_warnings(&[segment()], &root).is_empty());
     }
 }

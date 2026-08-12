@@ -9,13 +9,17 @@ mod media;
 mod translation;
 mod tts;
 
-use std::sync::Mutex;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use db::Database;
 use tauri::Manager;
 
 pub struct AppState {
     database: Mutex<Database>,
+    preview_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -28,6 +32,7 @@ pub fn run() {
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(AppState {
                 database: Mutex::new(database),
+                preview_locks: Mutex::new(HashMap::new()),
             });
             Ok(())
         })
@@ -38,6 +43,7 @@ pub fn run() {
             commands::media_probe,
             commands::media_prepare,
             commands::preview_media,
+            commands::preview_prepare,
             commands::job_enqueue,
             commands::job_list,
             commands::job_start,

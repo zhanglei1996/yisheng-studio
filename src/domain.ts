@@ -19,6 +19,7 @@ export interface Project {
   audioMode?: "duck" | "mute" | "separate";
   translationProviderId?: string | null;
   ttsProviderId?: string;
+  segmentCount?: number;
 }
 
 export interface MediaProbe {
@@ -44,6 +45,7 @@ export interface MediaArtifacts {
 export interface PreviewMedia {
   path: string;
   dubbed: boolean;
+  revision: number;
 }
 
 export type JobStatus = "queued" | "running" | "waiting_user" | "paused" | "succeeded" | "failed" | "cancelled";

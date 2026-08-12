@@ -186,7 +186,7 @@ where
     })
 }
 
-pub fn resolve_preview(artifact_dir: &Path, audio_mode: &str) -> Result<PreviewMedia, AppError> {
+pub fn resolve_preview(artifact_dir: &Path) -> Result<PreviewMedia, AppError> {
     let proxy = artifact_dir.join("preview-proxy.mp4");
     if !is_non_empty_file(&proxy) {
         return Err(AppError::Media("预览代理尚未生成".into()));
@@ -196,12 +196,21 @@ pub fn resolve_preview(artifact_dir: &Path, audio_mode: &str) -> Result<PreviewM
         return Ok(PreviewMedia {
             path: proxy.to_string_lossy().into_owned(),
             dubbed: false,
+            revision: media_revision(&proxy),
         });
     }
-    let dubbed = render_dubbed_preview(artifact_dir, audio_mode)?;
+    let dubbed = artifact_dir.join("dubbed-preview.mp4");
+    if is_non_empty_file(&dubbed) && preview_is_current(&dubbed, &[&proxy, &voice]) {
+        return Ok(PreviewMedia {
+            path: dubbed.to_string_lossy().into_owned(),
+            dubbed: true,
+            revision: media_revision(&dubbed),
+        });
+    }
     Ok(PreviewMedia {
-        path: dubbed.to_string_lossy().into_owned(),
-        dubbed: true,
+        path: proxy.to_string_lossy().into_owned(),
+        dubbed: false,
+        revision: media_revision(&proxy),
     })
 }
 
@@ -209,7 +218,9 @@ pub fn render_dubbed_preview(artifact_dir: &Path, audio_mode: &str) -> Result<Pa
     let proxy = artifact_dir.join("preview-proxy.mp4");
     let voice = artifact_dir.join("chinese-voice.wav");
     if !is_non_empty_file(&proxy) || !is_non_empty_file(&voice) {
-        return Err(AppError::Media("生成中文预览所需的代理视频或配音音轨缺失".into()));
+        return Err(AppError::Media(
+            "生成中文预览所需的代理视频或配音音轨缺失".into(),
+        ));
     }
     let target = artifact_dir.join("dubbed-preview.mp4");
     if preview_is_current(&target, &[&proxy, &voice]) {
@@ -293,6 +304,15 @@ fn is_non_empty_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn media_revision(path: &Path) -> u64 {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or_default()
+}
+
 fn run_ffmpeg<const N: usize>(
     source: &Path,
     target: &Path,
@@ -356,12 +376,52 @@ fn sanitize_process_error(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{prepare, probe, sanitize_process_error};
+    use super::{prepare, probe, resolve_preview, sanitize_process_error};
+    use std::io::Write;
 
     #[test]
     fn process_error_is_bounded() {
         let error = sanitize_process_error(b"one\ntwo\nthree\nfour\nfive");
         assert!(!error.contains("five"));
+    }
+
+    #[test]
+    fn resolving_preview_never_renders_on_the_read_path() {
+        let output =
+            std::env::temp_dir().join(format!("yisheng-preview-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&output).unwrap();
+        for name in ["preview-proxy.mp4", "chinese-voice.wav"] {
+            let mut file = std::fs::File::create(output.join(name)).unwrap();
+            file.write_all(b"fixture").unwrap();
+        }
+        let preview = resolve_preview(&output).unwrap();
+        assert!(!preview.dubbed);
+        assert!(preview.path.ends_with("preview-proxy.mp4"));
+        assert!(!output.join("dubbed-preview.mp4").exists());
+        std::fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn resolving_preview_reuses_a_current_dubbed_file_without_touching_it() {
+        let output =
+            std::env::temp_dir().join(format!("yisheng-preview-current-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&output).unwrap();
+        for name in ["preview-proxy.mp4", "chinese-voice.wav"] {
+            let mut file = std::fs::File::create(output.join(name)).unwrap();
+            file.write_all(b"dependency").unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let target = output.join("dubbed-preview.mp4");
+        let mut file = std::fs::File::create(&target).unwrap();
+        file.write_all(b"dubbed").unwrap();
+        drop(file);
+        let before = target.metadata().unwrap().modified().unwrap();
+        let preview = resolve_preview(&output).unwrap();
+        let after = target.metadata().unwrap().modified().unwrap();
+        assert!(preview.dubbed);
+        assert_eq!(preview.path, target.to_string_lossy());
+        assert_eq!(before, after);
+        std::fs::remove_dir_all(output).unwrap();
     }
 
     #[test]

@@ -4,9 +4,9 @@ import type { GlossaryTerm, Job, Project, Segment } from "./domain";
 export { courseFrame };
 
 export const projects: Project[] = [
-  { id: "p1", name: "Building Reliable AI Agents", duration: "24:18", progress: 78, status: "waiting_user", updatedAt: "今天 10:42", thumbnail: courseFrame },
-  { id: "p2", name: "React Server Components 深度解析", duration: "18:36", progress: 100, status: "ready", updatedAt: "昨天 18:20", thumbnail: courseFrame },
-  { id: "p3", name: "RAG From Scratch", duration: "42:07", progress: 36, status: "processing", updatedAt: "8 月 10 日", thumbnail: courseFrame },
+  { id: "p1", name: "Building Reliable AI Agents", duration: "24:18", progress: 78, status: "waiting_user", updatedAt: "今天 10:42", thumbnail: courseFrame, segmentCount: 48 },
+  { id: "p2", name: "React Server Components 深度解析", duration: "18:36", progress: 100, status: "ready", updatedAt: "昨天 18:20", thumbnail: courseFrame, segmentCount: 36 },
+  { id: "p3", name: "RAG From Scratch", duration: "42:07", progress: 36, status: "processing", updatedAt: "8 月 10 日", thumbnail: courseFrame, segmentCount: 82 },
 ];
 
 export const initialSegments: Segment[] = [
@@ -29,4 +29,3 @@ export const jobs: Job[] = [
   { id: "j2", project: "Building Reliable AI Agents", stage: "等待文本确认", progress: 78, status: "waiting_user", eta: "—" },
   { id: "j3", project: "LLM Evaluation Methods", stage: "等待队列", progress: 0, status: "queued", eta: "约 31 分钟后" },
 ];
-

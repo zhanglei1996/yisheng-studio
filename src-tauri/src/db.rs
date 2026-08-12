@@ -168,6 +168,7 @@ impl Database {
             audio_mode: "duck".into(),
             translation_provider_id: None,
             tts_provider_id: "system".into(),
+            segment_count: 0,
             created_at: now.clone(),
             updated_at: now,
         })
@@ -176,7 +177,7 @@ impl Database {
     pub fn list_projects(&self) -> Result<Vec<ProjectSummary>, AppError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, name, status, progress, source_path, source_fingerprint, duration_ms, width, height, artifact_dir, workflow_mode, audio_mode, translation_provider_id, tts_provider_id, created_at, updated_at FROM projects ORDER BY updated_at DESC")?;
+            .prepare("SELECT id, name, status, progress, source_path, source_fingerprint, duration_ms, width, height, artifact_dir, workflow_mode, audio_mode, translation_provider_id, tts_provider_id, created_at, updated_at, (SELECT COUNT(*) FROM segments WHERE segments.project_id = projects.id) FROM projects ORDER BY updated_at DESC")?;
         let rows = statement.query_map([], |row| {
             Ok(ProjectSummary {
                 id: row.get(0)?,
@@ -197,6 +198,7 @@ impl Database {
                 audio_mode: row.get(11)?,
                 translation_provider_id: row.get(12)?,
                 tts_provider_id: row.get(13)?,
+                segment_count: row.get::<_, i64>(16)?.max(0) as u32,
                 created_at: row.get(14)?,
                 updated_at: row.get(15)?,
             })
@@ -270,13 +272,13 @@ impl Database {
 
     pub fn get_project(&self, id: &str) -> Result<ProjectSummary, AppError> {
         self.connection.query_row(
-            "SELECT id, name, status, progress, source_path, source_fingerprint, duration_ms, width, height, artifact_dir, workflow_mode, audio_mode, translation_provider_id, tts_provider_id, created_at, updated_at FROM projects WHERE id=?1",
+            "SELECT id, name, status, progress, source_path, source_fingerprint, duration_ms, width, height, artifact_dir, workflow_mode, audio_mode, translation_provider_id, tts_provider_id, created_at, updated_at, (SELECT COUNT(*) FROM segments WHERE segments.project_id = projects.id) FROM projects WHERE id=?1",
             [id], |row| Ok(ProjectSummary {
                 id: row.get(0)?, name: row.get(1)?, status: parse_project_status(&row.get::<_, String>(2)?),
                 progress: row.get::<_, i64>(3)?.clamp(0,100) as u8, source_path: row.get(4)?, source_fingerprint: row.get(5)?, duration_ms: row.get(6)?,
                 width: row.get::<_, Option<i64>>(7)?.map(|value| value.max(0) as u32), height: row.get::<_, Option<i64>>(8)?.map(|value| value.max(0) as u32),
                 artifact_dir: row.get(9)?, workflow_mode: row.get(10)?, audio_mode: row.get(11)?, translation_provider_id: row.get(12)?, tts_provider_id: row.get(13)?,
-                created_at: row.get(14)?, updated_at: row.get(15)?,
+                segment_count: row.get::<_, i64>(16)?.max(0) as u32, created_at: row.get(14)?, updated_at: row.get(15)?,
             }),
         ).optional()?.ok_or_else(|| AppError::NotFound(id.into()))
     }
@@ -766,7 +768,39 @@ mod tests {
             })
             .unwrap();
         }
-        assert_eq!(db.list_projects().unwrap().len(), 1);
+        let projects = db.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].segment_count, 2);
+        assert_eq!(db.get_project("p1").unwrap().segment_count, 2);
+    }
+
+    #[test]
+    fn listing_a_large_project_stays_within_the_editor_navigation_budget() {
+        let db = Database::memory().unwrap();
+        db.create_project("large", "Large course").unwrap();
+        for ordinal in 0..136 {
+            let start_ms = ordinal * 1_000;
+            db.upsert_segment(&SegmentRecord {
+                id: format!("segment-{ordinal}"),
+                project_id: "large".into(),
+                ordinal,
+                start_ms,
+                end_ms: start_ms + 900,
+                source_text: "source".into(),
+                subtitle_zh: "字幕".into(),
+                spoken_zh: "配音".into(),
+                linked: true,
+                status: "ready".into(),
+            })
+            .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let segments = db.list_segments("large").unwrap();
+        assert_eq!(segments.len(), 136);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "136 segment read exceeded the 100ms navigation budget"
+        );
     }
 
     #[test]

@@ -1,3 +1,5 @@
+import { memo } from "react";
+import { useShallow } from "zustand/shallow";
 import { ArrowCounterClockwise, ClockCounterClockwise, Copy, Link, LinkBreak, LockSimple, MagicWand, Microphone, Play, SpeakerHigh } from "@phosphor-icons/react";
 import { Button, Input, Select, Segmented, Slider, Tooltip } from "antd";
 import { formatTimecode } from "../domain";
@@ -13,8 +15,10 @@ const MagicIcon = antdIcon(MagicWand);
 const RestoreIcon = antdIcon(ArrowCounterClockwise);
 const PlayIcon = antdIcon(Play);
 
-export function Inspector({ onRegenerate }: { onRegenerate: (segmentId: string) => Promise<void> }) {
-  const { segments, selectedId, inspectorTab, setInspectorTab, updateSegment } = useEditorStore();
+export const Inspector = memo(function Inspector({ onRegenerate }: { onRegenerate: (segmentId: string) => Promise<void> }) {
+  const { segments, selectedId, inspectorTab, setInspectorTab, updateSegment } = useEditorStore(useShallow((state) => ({
+    segments: state.segments, selectedId: state.selectedId, inspectorTab: state.inspectorTab, setInspectorTab: state.setInspectorTab, updateSegment: state.updateSegment,
+  })));
   const segment = segments.find((item) => item.id === selectedId) ?? segments[0];
   if (!segment) return null;
   const regenerate = () => onRegenerate(segment.id);
@@ -48,4 +52,4 @@ export function Inspector({ onRegenerate }: { onRegenerate: (segmentId: string) 
     </div>
     <footer className="inspector-footer"><Button icon={<MagicIcon />} onClick={regenerate}>重新生成本片段</Button></footer>
   </aside>;
-}
+});

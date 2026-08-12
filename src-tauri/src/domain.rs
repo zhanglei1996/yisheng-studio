@@ -17,6 +17,7 @@ pub struct ProjectSummary {
     pub audio_mode: String,
     pub translation_provider_id: Option<String>,
     pub tts_provider_id: String,
+    pub segment_count: u32,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -50,6 +51,7 @@ pub struct MediaArtifacts {
 pub struct PreviewMedia {
     pub path: String,
     pub dubbed: bool,
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

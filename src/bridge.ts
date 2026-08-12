@@ -68,6 +68,11 @@ export const desktopBridge = {
     return invoke ? invoke("preview_media", { projectId }) : null;
   },
 
+  async preparePreviewMedia(projectId: string): Promise<PreviewMedia | null> {
+    const invoke = tauriInvoke();
+    return invoke ? invoke("preview_prepare", { projectId }) : null;
+  },
+
   async listJobs(): Promise<PersistedJob[]> {
     const invoke = tauriInvoke();
     if (!invoke) return [];

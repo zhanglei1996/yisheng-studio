@@ -15,11 +15,6 @@ export function LibraryPage({ onCreate, onOpen }: { onCreate: () => void; onOpen
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("全部项目");
   const { data: availableProjects = projects } = useQuery({ queryKey: ["projects"], queryFn: desktopBridge.listProjects });
-  const { data: segmentCounts = {} } = useQuery({
-    queryKey: ["project-segment-counts", availableProjects.map((project) => project.id)],
-    queryFn: async () => Object.fromEntries(await Promise.all(availableProjects.map(async (project) => [project.id, (await desktopBridge.listSegments(project.id)).length]))),
-    enabled: desktopBridge.isDesktop() && availableProjects.length > 0,
-  });
   const filtered = useMemo(() => availableProjects.filter((project) => project.name.toLowerCase().includes(query.toLowerCase()) && (filter === "全部项目" || (filter === "处理中" ? project.status === "processing" : project.status === "ready"))), [availableProjects, query, filter]);
 
   return <div className="page library-page">
@@ -45,7 +40,7 @@ export function LibraryPage({ onCreate, onOpen }: { onCreate: () => void; onOpen
         <div className="project-thumb"><img src={project.thumbnail} alt="RAG 技术课程预览" /><span>{project.duration}</span></div>
         <div className="project-card-body">
           <div className="project-title-row"><h3>{project.name}</h3><span className={`status-chip ${project.status}`}>{project.status === "ready" ? <CheckCircle /> : project.status === "waiting_user" ? <WarningCircle /> : <Clock />}{statusLabel[project.status]}</span></div>
-          <p>英文 → 简体中文 · {segmentCounts[project.id] ?? "—"} 个片段</p>
+          <p>英文 → 简体中文 · {project.segmentCount ?? "—"} 个片段</p>
           <Progress percent={project.progress} showInfo={false} size="small" />
           <footer><span>{project.progress}%</span><span>{project.updatedAt}</span><Button type="link" size="small" onClick={() => onOpen(project.id)}>{project.status === "ready" ? "查看结果" : "继续处理"}</Button></footer>
         </div>

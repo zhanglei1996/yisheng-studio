@@ -1,13 +1,17 @@
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 
-export function WaveformCanvas({ color = "#8a9099", seed = 1 }: { color?: string; seed?: number }) {
+export const WaveformCanvas = memo(function WaveformCanvas({ color = "#8a9099", seed = 1 }: { color?: string; seed?: number }) {
   const ref = useRef<HTMLCanvasElement>(null);
+  const lastSize = useRef("");
   useEffect(() => {
     const canvas = ref.current;
     if (!canvas) return;
     const resize = () => {
       const ratio = window.devicePixelRatio || 1;
       const rect = canvas.getBoundingClientRect();
+      const size = `${Math.round(rect.width)}x${Math.round(rect.height)}@${ratio}`;
+      if (size === lastSize.current) return;
+      lastSize.current = size;
       canvas.width = Math.max(1, Math.round(rect.width * ratio));
       canvas.height = Math.max(1, Math.round(rect.height * ratio));
       const context = canvas.getContext("2d");
@@ -27,10 +31,13 @@ export function WaveformCanvas({ color = "#8a9099", seed = 1 }: { color?: string
       context.globalAlpha = 1;
     };
     resize();
-    const observer = new ResizeObserver(resize);
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(() => { frame = 0; resize(); });
+    });
     observer.observe(canvas);
-    return () => observer.disconnect();
+    return () => { if (frame) window.cancelAnimationFrame(frame); observer.disconnect(); };
   }, [color, seed]);
   return <canvas ref={ref} className="waveform-canvas" aria-hidden="true" />;
-}
-
+});

@@ -13,6 +13,18 @@ export default defineConfig({
   },
   build: {
     outDir: "dist/client",
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return;
+          if (id.includes("@tauri-apps")) return "desktop-runtime";
+          if (id.includes("@phosphor-icons")) return "icons";
+          if (id.includes("antd") || id.includes("@ant-design") || id.includes("rc-")) return "ui-vendor";
+          if (id.includes("react") || id.includes("zustand") || id.includes("@tanstack")) return "react-vendor";
+          return "vendor";
+        },
+      },
+    },
   },
   optimizeDeps: {
     include: ["react", "react-dom/client"],
