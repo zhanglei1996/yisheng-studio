@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b0d10" />
+    <link rel="icon" type="image/png" href="/app-icon.png" />
+    <title>译声工坊</title>
+    <style>
+      html, body, #root { margin: 0; width: 100%; height: 100%; background: #0b0d10; }
+      .app-boot { height: 100%; display: grid; place-items: center; color: #f3f5f7; font: 13px -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; }
+      .app-boot > div { display: grid; justify-items: center; gap: 12px; }
+      .app-boot img { width: 64px; height: 64px; border-radius: 15px; box-shadow: 0 14px 38px rgba(0,0,0,.32); }
+      .app-boot strong { font-size: 15px; }
+      .app-boot span { color: #8f99a5; }
+      .app-boot i { width: 124px; height: 3px; overflow: hidden; border-radius: 3px; background: #222a33; }
+      .app-boot i::after { content: ""; display: block; width: 42%; height: 100%; border-radius: inherit; background: #2f7dff; animation: boot 1.1s ease-in-out infinite alternate; }
+      .app-boot button { min-height: 32px; padding: 0 13px; border: 1px solid #35404d; border-radius: 6px; color: #f3f5f7; background: #171c22; font: inherit; cursor: pointer; }
+      @keyframes boot { from { transform: translateX(-8%); } to { transform: translateX(150%); } }
+    </style>
+  </head>
+  <body>
+    <div id="root"><div class="app-boot" aria-label="译声工坊正在启动"><div><img src="/app-icon.png" alt="" /><strong>译声工坊</strong><span>正在打开本地工作区…</span><i /></div></div></div>
+    <script>
+      window.setTimeout(() => {
+        const boot = document.querySelector(".app-boot");
+        if (!boot) return;
+        boot.querySelector("span").textContent = "启动时间较长，请重新加载开发预览";
+        const progress = boot.querySelector("i");
+        const retry = document.createElement("button");
+        retry.textContent = "重新加载";
+        retry.onclick = () => window.location.reload();
+        progress.replaceWith(retry);
+      }, 8000);
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

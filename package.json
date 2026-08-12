@@ -1,0 +1,37 @@
+{
+  "name": "yisheng-studio",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:desktop": "tauri dev",
+    "dev:app": "tauri build --debug --bundles app",
+    "tauri": "tauri",
+    "typecheck": "tsc --noEmit",
+    "build": "vite build && node scripts/prepare-sites-build.mjs",
+    "preview": "vite preview",
+    "test:sites": "node --test tests/sites-worker.test.mjs"
+  },
+  "dependencies": {
+    "@ant-design/icons": "^6.3.2",
+    "@phosphor-icons/react": "^2.1.10",
+    "@tanstack/react-query": "^5.101.4",
+    "@tauri-apps/plugin-dialog": "^2.7.2",
+    "@tauri-apps/api": "^2.10.1",
+    "@vitejs/plugin-react": "5.0.4",
+    "antd": "^6.6.0",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "react-router-dom": "^7.18.2",
+    "vite": "6.4.2",
+    "zod": "^4.4.3",
+    "zustand": "^5.0.14"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "typescript": "^7.0.2"
+  }
+}
