@@ -9,9 +9,18 @@
     "dev:app": "tauri build --debug --bundles app",
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
-    "build": "vite build && node scripts/prepare-sites-build.mjs",
+    "build:app": "vite build",
+    "build:sites": "vite build && node scripts/prepare-sites-build.mjs",
+    "build": "pnpm build:app",
     "preview": "vite preview",
-    "test:sites": "node --test tests/sites-worker.test.mjs"
+    "test:sites": "node --test tests/sites-worker.test.mjs",
+    "test:worker": "node --test --test-name-pattern=\"^(serves|falls|does)\" tests/sites-worker.test.mjs",
+    "verify:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "verify:rust:quality": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings && cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check",
+    "verify:fast": "node scripts/run-parallel.mjs \"pnpm typecheck\" \"pnpm test:worker\" \"cargo check --manifest-path src-tauri/Cargo.toml --all-targets --all-features --quiet\"",
+    "verify:full": "node scripts/run-parallel.mjs \"pnpm typecheck\" \"pnpm build:app\" \"pnpm verify:rust\" \"pnpm verify:rust:quality\"",
+    "verify:release": "pnpm verify:full && pnpm tauri build --debug --bundles app --config '{\"build\":{\"beforeBuildCommand\":\"\"}}'",
+    "verify:sites": "pnpm build:sites && pnpm test:sites"
   },
   "dependencies": {
     "@ant-design/icons": "^6.3.2",

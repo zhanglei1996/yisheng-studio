@@ -15,4 +15,8 @@ Prefer codebase-memory-mcp graph tools for code discovery and impact tracing. Re
 
 ## Verification
 
-For UI work, run `pnpm typecheck`, `pnpm build`, and the relevant interaction checks. Product Design changes must update `design-qa.md` and pass visual comparison before handoff.
+- Default to local-only verification. Do not deploy or publish to Sites unless the user explicitly asks to deploy or publish.
+- During implementation, use `pnpm verify:fast`; before handoff, use `pnpm verify:full` plus the relevant interaction checks.
+- Run `pnpm verify:release` only when the user explicitly needs a refreshed standalone macOS app bundle.
+- Run `pnpm verify:sites` only for Sites-specific changes. This command is local-only; deployment still requires an explicit user request.
+- Product Design changes must update `design-qa.md` and pass visual comparison before handoff.

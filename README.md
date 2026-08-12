@@ -39,15 +39,21 @@ pnpm dev:app
 
 ## 验证
 
+日常开发先运行数秒级的本地快速验收；交付前运行完整本地验收。两者都会并行执行前后端检查，不包含站点部署：
+
 ```bash
-pnpm typecheck
-pnpm build
-pnpm test:sites
-cargo test --manifest-path src-tauri/Cargo.toml
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-pnpm tauri build --debug --bundles app
+pnpm verify:fast
+pnpm verify:full
 ```
 
-当前开发构建位于 `src-tauri/target/debug/bundle/macos/译声工坊.app`。请通过 `pnpm dev:app` 更新此构建，不要把 `pnpm dev:desktop` 运行中的临时开发壳当成可独立启动版本。API Key 在应用左侧“服务商”中配置；不要写入仓库配置文件。
+只有明确需要刷新可独立启动的 macOS App 时才运行：
+
+```bash
+pnpm verify:release
+```
+
+Sites 不属于默认验收流程。仅在修改 Sites 适配或明确要求部署时运行 `pnpm verify:sites`；该命令只做本地 Sites 构建和测试，不会部署。
+
+当前开发构建位于 `src-tauri/target/debug/bundle/macos/译声工坊.app`。请通过 `pnpm dev:app` 或 `pnpm verify:release` 更新此构建，不要把 `pnpm dev:desktop` 运行中的临时开发壳当成可独立启动版本。API Key 在应用左侧“服务商”中配置；不要写入仓库配置文件。
 
 视觉验收记录见 [`design-qa.md`](design-qa.md)。
