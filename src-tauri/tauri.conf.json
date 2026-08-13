@@ -26,7 +26,8 @@
           "y": 17
         },
         "hiddenTitle": true,
-        "transparent": false
+        "transparent": false,
+        "dragDropEnabled": true
       }
     ],
     "security": {

@@ -2,7 +2,7 @@
 pub enum AppError {
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
-    #[error("credential error: {0}")]
+    #[error("凭据错误：{0}")]
     Credential(String),
     #[error("not found: {0}")]
     NotFound(String),

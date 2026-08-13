@@ -25,7 +25,7 @@ export const glossaryTerms: GlossaryTerm[] = [
 ];
 
 export const jobs: Job[] = [
-  { id: "j1", project: "RAG From Scratch", stage: "本地语音识别", progress: 36, status: "running", eta: "约 08:20" },
-  { id: "j2", project: "Building Reliable AI Agents", stage: "等待文本确认", progress: 78, status: "waiting_user", eta: "—" },
+  { id: "j1", projectId: "p3", project: "RAG From Scratch", stage: "本地语音识别", progress: 36, status: "running", eta: "约 08:20" },
+  { id: "j2", projectId: "p1", project: "Building Reliable AI Agents", stage: "等待文本确认", progress: 78, status: "waiting_user", eta: "—" },
   { id: "j3", project: "LLM Evaluation Methods", stage: "等待队列", progress: 0, status: "queued", eta: "约 31 分钟后" },
 ];

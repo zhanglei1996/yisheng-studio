@@ -1,9 +1,23 @@
 [package]
 name = "yisheng-studio"
+default-run = "yisheng-studio"
+autobins = false
 version = "0.1.0"
 description = "Local-first AI video localization studio"
 authors = ["Yisheng Studio"]
 edition = "2021"
+
+[features]
+tts-smoke-harness = []
+
+[[bin]]
+name = "yisheng-studio"
+path = "src/main.rs"
+
+[[bin]]
+name = "tts-smoke"
+path = "src/bin/tts-smoke.rs"
+required-features = ["tts-smoke-harness"]
 
 [lib]
 name = "yisheng_studio_lib"
@@ -24,3 +38,9 @@ keyring = { version = "3", features = ["apple-native"] }
 sha2 = "0.10"
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"
+futures-util = "0.3"
+hmac = "0.12"
+httpdate = "1"
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio = { version = "1", features = ["rt", "time"] }

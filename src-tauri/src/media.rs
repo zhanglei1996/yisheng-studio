@@ -9,8 +9,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    domain::{MediaArtifacts, MediaProbe, PreviewMedia},
+    domain::{MediaArtifacts, MediaProbe, PreviewMedia, TimelineEdit},
     error::AppError,
+    timeline_map::TimelineMap,
 };
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +123,7 @@ where
     std::fs::create_dir_all(&artifact_dir).map_err(|error| AppError::Media(error.to_string()))?;
     let audio_path = artifact_dir.join("source-16k-mono.wav");
     let proxy_path = artifact_dir.join("preview-proxy.mp4");
+    ensure_thumbnail(project_id, source, root)?;
 
     if !is_non_empty_file(&audio_path) {
         progress("audio_extract", 4, "media:extracting-audio")?;
@@ -186,6 +188,48 @@ where
     })
 }
 
+/// Return a cached project cover rendered from the source video's first
+/// decoded frame. The source stays in place; only the small JPEG is cached.
+pub fn ensure_thumbnail(project_id: &str, source: &Path, root: &Path) -> Result<PathBuf, AppError> {
+    if !source.is_file() {
+        return Err(AppError::Media("项目原始视频不存在，无法生成封面".into()));
+    }
+    let artifact_dir = root.join("projects").join(project_id).join("media");
+    std::fs::create_dir_all(&artifact_dir).map_err(|error| AppError::Media(error.to_string()))?;
+    let target = artifact_dir.join("cover-first-frame.jpg");
+    if is_non_empty_file(&target) {
+        return Ok(target);
+    }
+    let temporary = artifact_dir.join("cover-first-frame.pending.jpg");
+    let _ = std::fs::remove_file(&temporary);
+    let output = Command::new(resolve_binary("ffmpeg"))
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(source)
+        .args([
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=min(960\\,iw):-2",
+            "-q:v",
+            "3",
+        ])
+        .arg(&temporary)
+        .output()
+        .map_err(|error| AppError::Media(format!("无法启动首帧封面生成：{error}")))?;
+    if !output.status.success() || !is_non_empty_file(&temporary) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(AppError::Media(format!(
+            "首帧封面生成失败：{}",
+            sanitize_process_error(&output.stderr)
+        )));
+    }
+    std::fs::rename(&temporary, &target)
+        .map_err(|error| AppError::Media(format!("无法保存首帧封面：{error}")))?;
+    Ok(target)
+}
+
 pub fn resolve_preview(artifact_dir: &Path) -> Result<PreviewMedia, AppError> {
     let proxy = artifact_dir.join("preview-proxy.mp4");
     if !is_non_empty_file(&proxy) {
@@ -228,15 +272,23 @@ pub fn render_dubbed_preview(artifact_dir: &Path, audio_mode: &str) -> Result<Pa
     }
     let temporary = artifact_dir.join("dubbed-preview.pending.mp4");
     let _ = std::fs::remove_file(&temporary);
-    let primary_filter = if audio_mode == "mute" {
-        "[1:a]volume=1[aout]"
-    } else {
-        "[0:a]volume=0.16[original];[original][1:a]amix=inputs=2:duration=first:normalize=0[aout]"
-    };
-    let result = render_preview_command(&proxy, &voice, &temporary, primary_filter).or_else(|_| {
-        let _ = std::fs::remove_file(&temporary);
-        render_preview_command(&proxy, &voice, &temporary, "[1:a]volume=1[aout]")
-    });
+    let source_gain = if audio_mode == "mute" { 0.42 } else { 0.72 };
+    let primary_filter = format!(
+        "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,volume={source_gain:.2}[original];\
+         [1:a]aformat=sample_rates=48000:channel_layouts=stereo[voice];\
+         [original][voice]sidechaincompress=threshold=0.015:ratio=18:attack=12:release=360[ducked];\
+         [ducked][voice]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-16:TP=-1.0:LRA=7[aout]"
+    );
+    let result =
+        render_preview_command(&proxy, &voice, &temporary, &primary_filter).or_else(|_| {
+            let _ = std::fs::remove_file(&temporary);
+            render_preview_command(
+                &proxy,
+                &voice,
+                &temporary,
+                "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=1[aout]",
+            )
+        });
     if let Err(error) = result {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
@@ -244,6 +296,94 @@ pub fn render_dubbed_preview(artifact_dir: &Path, audio_mode: &str) -> Result<Pa
     std::fs::rename(&temporary, &target)
         .map_err(|error| AppError::Media(format!("无法更新中文预览：{error}")))?;
     Ok(target)
+}
+
+/// Prepare the best preview currently possible. An incomplete TTS run is a
+/// normal product state, so a missing voice track falls back to the source
+/// proxy instead of surfacing an error toast. Actual FFmpeg failures still
+/// propagate once both dependencies are present.
+pub fn prepare_preview(artifact_dir: &Path, audio_mode: &str) -> Result<PreviewMedia, AppError> {
+    let current = resolve_preview(artifact_dir)?;
+    if current.dubbed {
+        return Ok(current);
+    }
+    let voice = artifact_dir.join("chinese-voice.wav");
+    if !is_non_empty_file(&voice) {
+        return Ok(current);
+    }
+    match render_dubbed_preview(artifact_dir, audio_mode) {
+        Ok(path) => Ok(PreviewMedia {
+            revision: media_revision(&path),
+            path: path.to_string_lossy().into_owned(),
+            dubbed: true,
+        }),
+        Err(AppError::Media(message)) if message == "生成中文预览所需的代理视频或配音音轨缺失" => {
+            resolve_preview(artifact_dir)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn prepare_timeline_preview(
+    artifact_dir: &Path,
+    audio_mode: &str,
+    source_duration_ms: i64,
+    edits: &[TimelineEdit],
+) -> Result<PreviewMedia, AppError> {
+    let current = prepare_preview(artifact_dir, audio_mode)?;
+    if !current.dubbed || !edits.iter().any(|edit| edit.accepted) {
+        return Ok(current);
+    }
+    let map = TimelineMap::from_edits(source_duration_ms, edits)?;
+    let target = artifact_dir.join("timeline-preview.mp4");
+    let temporary = artifact_dir.join("timeline-preview.pending.mp4");
+    if preview_is_current(&target, &[Path::new(&current.path)]) {
+        return Ok(PreviewMedia {
+            revision: media_revision(&target),
+            path: target.to_string_lossy().into_owned(),
+            dubbed: true,
+        });
+    }
+    let edited = map.spans().iter().any(|span| span.operation != "keep");
+    let (video_label, audio_label, filter) = crate::exporter::media_timeline_filter(&map, edited);
+    let output = Command::new(resolve_binary("ffmpeg"))
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&current.path)
+        .args([
+            "-filter_complex",
+            &filter,
+            "-map",
+            video_label,
+            "-map",
+            audio_label,
+            "-c:v",
+            "h264_videotoolbox",
+            "-b:v",
+            "1800k",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(&temporary)
+        .output()
+        .map_err(|error| AppError::Media(format!("无法启动时间线预览：{error}")))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(AppError::Media(format!(
+            "时间线预览生成失败：{}",
+            sanitize_process_error(&output.stderr)
+        )));
+    }
+    std::fs::rename(&temporary, &target)
+        .map_err(|error| AppError::Media(format!("无法更新时间线预览：{error}")))?;
+    Ok(PreviewMedia {
+        revision: media_revision(&target),
+        path: target.to_string_lossy().into_owned(),
+        dubbed: true,
+    })
 }
 
 fn render_preview_command(
@@ -376,8 +516,12 @@ fn sanitize_process_error(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{prepare, probe, resolve_preview, sanitize_process_error};
+    use super::{
+        ensure_thumbnail, prepare, prepare_preview, probe, resolve_binary, resolve_preview,
+        sanitize_process_error,
+    };
     use std::io::Write;
+    use std::process::Command;
 
     #[test]
     fn process_error_is_bounded() {
@@ -395,6 +539,22 @@ mod tests {
             file.write_all(b"fixture").unwrap();
         }
         let preview = resolve_preview(&output).unwrap();
+        assert!(!preview.dubbed);
+        assert!(preview.path.ends_with("preview-proxy.mp4"));
+        assert!(!output.join("dubbed-preview.mp4").exists());
+        std::fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn preparing_preview_without_a_voice_track_quietly_uses_the_proxy() {
+        let output =
+            std::env::temp_dir().join(format!("yisheng-preview-no-voice-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&output).unwrap();
+        let mut proxy = std::fs::File::create(output.join("preview-proxy.mp4")).unwrap();
+        proxy.write_all(b"proxy").unwrap();
+        drop(proxy);
+
+        let preview = prepare_preview(&output, "mix").unwrap();
         assert!(!preview.dubbed);
         assert!(preview.path.ends_with("preview-proxy.mp4"));
         assert!(!output.join("dubbed-preview.mp4").exists());
@@ -421,6 +581,40 @@ mod tests {
         assert!(preview.dubbed);
         assert_eq!(preview.path, target.to_string_lossy());
         assert_eq!(before, after);
+        std::fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn project_cover_is_generated_from_video_and_reuses_the_cache() {
+        let output = std::env::temp_dir().join(format!("yisheng-cover-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&output).unwrap();
+        let source = output.join("source.mp4");
+        let ffmpeg = Command::new(resolve_binary("ffmpeg"))
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=0x3366cc:s=160x90:d=0.2",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&source)
+            .output()
+            .expect("start ffmpeg fixture generation");
+        assert!(ffmpeg.status.success());
+
+        let cover = ensure_thumbnail("sample", &source, &output).unwrap();
+        assert!(cover.ends_with("projects/sample/media/cover-first-frame.jpg"));
+        assert!(cover.metadata().unwrap().len() > 100);
+        let before = cover.metadata().unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let cached = ensure_thumbnail("sample", &source, &output).unwrap();
+        assert_eq!(cover, cached);
+        assert_eq!(before, cached.metadata().unwrap().modified().unwrap());
         std::fs::remove_dir_all(output).unwrap();
     }
 

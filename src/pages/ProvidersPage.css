@@ -1,0 +1,62 @@
+.provider-page .provider-card.online-tts {
+  border-color: #30405a;
+}
+
+.provider-page .provider-card.online-tts .provider-logo {
+  color: #86b3f8;
+  background: rgba(47, 125, 255, .13);
+}
+
+.provider-page .connection-chip.testing {
+  color: #87aff0;
+  background: rgba(47, 125, 255, .13);
+}
+
+.provider-page .connection-chip.error {
+  color: #f08a8a;
+  background: rgba(240, 82, 82, .11);
+}
+
+.provider-page .connection-chip.desktop_only {
+  color: #d7ae69;
+  background: rgba(245, 165, 36, .1);
+}
+
+.provider-page .provider-data-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -4px 0 13px;
+  color: #83bfa8;
+  font-size: 10px;
+}
+
+.provider-page .provider-data-note svg {
+  flex: 0 0 auto;
+}
+
+.provider-modal .ant-modal-body {
+  max-height: min(680px, calc(100vh - 210px));
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.provider-modal .provider-secret-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.provider-modal .provider-secret-grid .ant-form-item {
+  min-width: 0;
+}
+
+.provider-modal .provider-privacy-note {
+  margin-top: 5px;
+}
+
+@media (max-width: 1240px) {
+  .provider-page .provider-grid {
+    grid-template-columns: 1fr;
+  }
+}

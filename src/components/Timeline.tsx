@@ -1,11 +1,13 @@
-import { memo, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
-import { Button, Slider, Tooltip } from "antd";
-import { ArrowsMerge, CursorClick, Eye, LockSimple, Magnet, Minus, Plus, Scissors, SpeakerHigh } from "@phosphor-icons/react";
+import { Button, Slider, Tooltip, message } from "antd";
+import { ArrowsMerge, CaretLeft, CaretRight, CursorClick, Eye, MagicWand, Magnet, Minus, Plus, Scissors } from "@phosphor-icons/react";
 import { formatTimecode } from "../domain";
 import { useEditorStore } from "../store";
 import { WaveformCanvas } from "./WaveformCanvas";
 import { antdIcon } from "../ui/icons";
+import { desktopBridge } from "../bridge";
+import { useQueryClient } from "@tanstack/react-query";
 
 const SelectIcon = antdIcon(CursorClick);
 const SplitIcon = antdIcon(Scissors);
@@ -15,19 +17,53 @@ const MagnetIcon = antdIcon(Magnet);
 const BASE_VIEW_DURATION = 21000;
 
 export const Timeline = memo(function Timeline() {
+  const queryClient = useQueryClient();
   const trackRef = useRef<HTMLDivElement>(null);
   const [snapping, setSnapping] = useState(true);
-  const { segments, selectedId, selectSegment, setPlayhead, zoom, setZoom, updateSegment, splitSelected, mergeNext } = useEditorStore(useShallow((state) => ({
+  const [panMs, setPanMs] = useState(0);
+  const { segments, loadedProjectId, selectedId, selectSegment, setPlayhead, zoom, setZoom, updateSegment, splitSelected, mergeNext, localization, setLocalization } = useEditorStore(useShallow((state) => ({
     segments: state.segments, selectedId: state.selectedId, selectSegment: state.selectSegment, setPlayhead: state.setPlayhead,
-    zoom: state.zoom, setZoom: state.setZoom, updateSegment: state.updateSegment, splitSelected: state.splitSelected, mergeNext: state.mergeNext,
+    loadedProjectId: state.loadedProjectId, zoom: state.zoom, setZoom: state.setZoom, updateSegment: state.updateSegment, splitSelected: state.splitSelected, mergeNext: state.mergeNext, localization: state.localization, setLocalization: state.setLocalization,
   })));
+  const [analyzing, setAnalyzing] = useState(false);
   const duration = BASE_VIEW_DURATION / zoom;
   const selected = segments.find((segment) => segment.id === selectedId);
-  const viewStart = Math.max(0, (selected?.startMs ?? segments[0]?.startMs ?? 0) - duration * 0.28);
+  const projectEnd = segments.at(-1)?.endMs ?? duration;
+  const baseViewStart = (selected?.startMs ?? segments[0]?.startMs ?? 0) - duration * 0.28;
+  const viewStart = Math.min(Math.max(0, projectEnd - duration), Math.max(0, baseViewStart + panMs));
   const end = viewStart + duration;
   const ticks = useMemo(() => Array.from({ length: 8 }, (_, index) => viewStart + index * duration / 7), [duration, viewStart]);
   const position = (ms: number) => ((ms - viewStart) / duration) * 100;
   const visible = segments.filter((segment) => segment.endMs >= viewStart && segment.startMs <= end);
+  useEffect(() => setPanMs(0), [selectedId]);
+  const panTimeline = (delta: number) => setPanMs((current) => current + delta);
+
+  const analyzeSync = async () => {
+    if (!loadedProjectId) return;
+    setAnalyzing(true);
+    try {
+      const analysis = await desktopBridge.analyzeLocalization(loadedProjectId, true);
+      setLocalization(analysis);
+      message.success(analysis?.timelineEdits.length ? `发现 ${analysis.timelineEdits.length} 个可优化区间` : "音画节奏已经较紧凑");
+    } catch (error) {
+      message.error(`同步分析失败：${String(error)}`);
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  const toggleTimelineEdit = async (editId: string, accepted: boolean) => {
+    if (!loadedProjectId) return;
+    try {
+      const analysis = await desktopBridge.acceptTimelineEdit(loadedProjectId, editId, accepted);
+      setLocalization(analysis);
+      const prepared = await desktopBridge.preparePreviewMedia(loadedProjectId);
+      if (prepared) queryClient.setQueriesData({ queryKey: ["preview-media", loadedProjectId] }, prepared);
+      message.success(accepted ? "已加入导出时间线，可再次点击撤销" : "已从导出时间线移除");
+    } catch (error) {
+      message.error(String(error));
+    }
+  };
 
   const moveBoundary = (id: string, side: "start" | "end", event: React.PointerEvent) => {
     event.preventDefault();
@@ -95,23 +131,34 @@ export const Timeline = memo(function Timeline() {
 
   return <section className="timeline-panel">
     <div className="timeline-toolbar">
-      <div className="tool-group"><Tooltip title="选择工具"><Button className="tool-button active" icon={<SelectIcon />} aria-label="选择工具" /></Tooltip><Tooltip title="拆分片段"><Button className="tool-button" icon={<SplitIcon />} aria-label="拆分片段" onClick={splitSelected} /></Tooltip><Tooltip title="合并下一片段"><Button className="tool-button" icon={<MergeIcon />} aria-label="合并下一片段" onClick={mergeNext} /></Tooltip><Tooltip title="吸附"><Button className={`tool-button ${snapping ? "active-soft" : ""}`} icon={<MagnetIcon />} aria-label="吸附" aria-pressed={snapping} onClick={() => setSnapping(!snapping)} /></Tooltip></div>
+      <div className="tool-group"><Tooltip title="选择工具已启用"><span className="tool-status" aria-label="选择工具已启用"><SelectIcon /></span></Tooltip><Tooltip title="拆分片段"><Button className="tool-button" icon={<SplitIcon />} aria-label="拆分片段" onClick={splitSelected} /></Tooltip><Tooltip title="合并下一片段"><Button className="tool-button" icon={<MergeIcon />} aria-label="合并下一片段" onClick={mergeNext} /></Tooltip><Tooltip title="吸附"><Button className={`tool-button ${snapping ? "active-soft" : ""}`} icon={<MagnetIcon />} aria-label="吸附" aria-pressed={snapping} onClick={() => setSnapping(!snapping)} /></Tooltip></div>
+      <Tooltip title="分析停顿、静止画面与同步锚点"><Button className="sync-analysis-button" size="small" icon={<MagicWand />} loading={analyzing} onClick={analyzeSync}>优化音画同步</Button></Tooltip>
       <TimelineTimecode />
+      <div className="timeline-pan"><Tooltip title="向左移动时间轴"><Button type="text" size="small" icon={<CaretLeft />} aria-label="向左移动时间轴" onClick={() => panTimeline(-duration * 0.7)} /></Tooltip><span>左右滑动</span><Tooltip title="向右移动时间轴"><Button type="text" size="small" icon={<CaretRight />} aria-label="向右移动时间轴" onClick={() => panTimeline(duration * 0.7)} /></Tooltip></div>
       <div className="zoom-control"><span>缩放</span><Minus size={14} /><Slider aria-label="时间轴缩放" min={0.7} max={2.4} step={0.1} value={zoom} onChange={setZoom} tooltip={{ open: false }} /><Plus size={14} /></div>
     </div>
     <div className="timeline-body">
       <div className="track-labels">
         <div className="ruler-label" />
-        {[{ title: "原始音频", sub: "英语 · 48kHz" }, { title: "背景声音", sub: "BGM · -18.0 LUFS" }, { title: "中文配音", sub: "女声 · 自然风格" }, { title: "双语字幕", sub: `${segments.length} 个片段` }].map((track) => <div className="track-label" key={track.title}><Eye /><span><strong>{track.title}</strong><small>{track.sub}</small></span><SpeakerHigh className="track-action" /><LockSimple className="track-action" /></div>)}
+        {[{ title: "场景与画面", sub: localization ? `${localization.scenes.length} 场景 · ${localization.anchors.length} 锚点` : "等待智能同步分析" }, { title: "背景声音", sub: "原声动态避让" }, { title: "中文配音", sub: "场景级连贯旁白" }, { title: "双语字幕", sub: `${segments.length} 个片段` }].map((track) => <div className="track-label" key={track.title}><Eye /><span><strong>{track.title}</strong><small>{track.sub}</small></span></div>)}
       </div>
-      <div className="track-content" ref={trackRef} onPointerDown={(event) => {
+      <div className="track-content" ref={trackRef} onWheel={(event) => {
+        const delta = Math.abs(event.deltaX) > 0 ? event.deltaX : event.shiftKey ? event.deltaY : 0;
+        if (!delta) return;
+        event.preventDefault();
+        panTimeline(delta * duration / 900);
+      }} onPointerDown={(event) => {
         const rect = event.currentTarget.getBoundingClientRect();
         setPlayhead(viewStart + ((event.clientX - rect.left) / rect.width) * duration);
       }}>
         <div className="time-ruler">{ticks.map((tick) => <span key={tick} style={{ left: `${position(tick)}%` }}><i />{formatTimecode(tick, true)}</span>)}</div>
-        <div className="audio-track original"><WaveformCanvas seed={11} /></div>
+        <div className="audio-track original localization-track"><WaveformCanvas seed={11} />{localization?.scenes.filter((scene) => scene.sourceEndMs >= viewStart && scene.sourceStartMs <= end).map((scene) => <span className="scene-range" key={scene.id} style={{ left: `${position(scene.sourceStartMs)}%`, width: `${Math.max(1, position(scene.sourceEndMs) - position(scene.sourceStartMs))}%` }} title={scene.spokenZh}>场景 {scene.ordinal + 1}</span>)}{localization?.anchors.filter((anchor) => anchor.sourceTimeMs >= viewStart && anchor.sourceTimeMs <= end).map((anchor) => <i className={`sync-anchor ${anchor.priority}`} key={anchor.id} style={{ left: `${position(anchor.sourceTimeMs)}%` }} title={`${anchor.priority === "exact" ? "精确" : "邻近"}锚点 · ${anchor.phrase}`} />)}{localization?.timelineEdits.filter((edit) => edit.sourceEndMs >= viewStart && edit.sourceStartMs <= end).map((edit) => <button type="button" className={`timeline-edit ${edit.operation} ${edit.accepted ? "accepted" : "suggested"}`} key={edit.id} style={{ left: `${position(edit.sourceStartMs)}%`, width: `${Math.max(1, position(edit.sourceEndMs) - position(edit.sourceStartMs))}%` }} title={`${edit.reason} · ${edit.accepted ? "点击撤销" : "点击采用"}`} aria-pressed={edit.accepted} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void toggleTimelineEdit(edit.id, !edit.accepted); }}>{edit.operation === "cut" ? "裁剪" : `${edit.rate?.toFixed(1)}×`}</button>)}</div>
         <div className="audio-track background"><WaveformCanvas seed={29} color="#3b8b62" /></div>
-        <div className="segment-track dub-track">{visible.map((segment) => <button key={segment.id} className={`timeline-segment dub ${selectedId === segment.id ? "selected" : ""} ${segment.status}`} style={{ left: `${position(segment.startMs)}%`, width: `${Math.max(1.3, position(segment.endMs) - position(segment.startMs))}%` }} onClick={(event) => { event.stopPropagation(); selectSegment(segment.id); }}><span>{segment.spokenZh}</span>{segment.overflowMs && <em>! 时长超出 {(segment.overflowMs / 1000).toFixed(1)} 秒</em>}<i className="resize-handle start" onPointerDown={(event) => moveBoundary(segment.id, "start", event)} /><i className="resize-handle end" onPointerDown={(event) => moveBoundary(segment.id, "end", event)} /></button>)}</div>
+        <div className="segment-track dub-track">{visible.map((segment) => {
+          const durationPending = segment.status === "warning" && !segment.ttsDurationMs;
+          const warningLabel = durationPending ? "时长待适配" : segment.overflowMs ? `时长超出 ${(segment.overflowMs / 1000).toFixed(1)} 秒` : "";
+          return <button key={segment.id} data-segment-id={segment.id} aria-label={`${segment.spokenZh}${warningLabel ? `，${warningLabel}` : ""}`} className={`timeline-segment dub ${selectedId === segment.id ? "selected" : ""} ${segment.status}`} style={{ left: `${position(segment.startMs)}%`, width: `${Math.max(1.3, position(segment.endMs) - position(segment.startMs))}%` }} onClick={(event) => { event.stopPropagation(); selectSegment(segment.id); }}><span>{segment.spokenZh}</span>{segment.overflowMs && <em><strong aria-hidden="true">!</strong> {warningLabel}</em>}<i className="resize-handle start" onPointerDown={(event) => moveBoundary(segment.id, "start", event)} /><i className="resize-handle end" onPointerDown={(event) => moveBoundary(segment.id, "end", event)} /></button>;
+        })}</div>
         <div className="segment-track subtitle-track">{visible.map((segment) => <button key={segment.id} className={`timeline-segment subtitle ${selectedId === segment.id ? "selected" : ""}`} style={{ left: `${position(segment.startMs)}%`, width: `${Math.max(1.3, position(segment.endMs) - position(segment.startMs))}%` }} onClick={(event) => { event.stopPropagation(); selectSegment(segment.id); }}><span>{segment.sourceText}</span><strong>{segment.subtitleZh}</strong><small>{formatTimecode(segment.startMs, true)} – {formatTimecode(segment.endMs, true)}</small></button>)}</div>
         <TimelinePlayhead viewStart={viewStart} duration={duration} />
       </div>

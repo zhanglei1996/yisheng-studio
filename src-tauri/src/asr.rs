@@ -80,6 +80,13 @@ pub fn transcribe(
                 spoken_zh: String::new(),
                 linked: true,
                 status: "ready".into(),
+                script_doc_json: String::new(),
+                script_revision: 1,
+                tts_overrides_json: "{}".into(),
+                tts_state: "missing".into(),
+                tts_error_message: None,
+                tts_settings_hash: None,
+                tts_duration_ms: None,
             })
         })
         .collect())
