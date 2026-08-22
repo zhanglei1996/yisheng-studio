@@ -61,8 +61,10 @@ pnpm verify:release
 
 Sites 不属于默认验收流程。仅在修改 Sites 适配或明确要求部署时运行 `pnpm verify:sites`；该命令只做本地 Sites 构建和测试，不会部署。
 
-当前开发构建位于 `src-tauri/target/debug/bundle/macos/译声工坊.app`。请通过 `pnpm dev:app` 或 `pnpm verify:release` 更新此构建，不要把 `pnpm dev:desktop` 运行中的临时开发壳当成可独立启动版本。API Key 在应用左侧“服务商”中配置；不要写入仓库配置文件。
+当前开发构建位于 `src-tauri/target/debug/bundle/macos/译声工坊.app`。请通过 `pnpm dev:app` 或 `pnpm verify:release` 更新此构建，不要把 `pnpm dev:desktop` 运行中的临时开发壳当成可独立启动版本。`verify:release` 会完成本机独立运行所需的 ad-hoc 签名和严格 Bundle 校验；面向外部分发时仍需使用 Apple Developer ID 签名并完成 notarization。API Key 在应用左侧“服务商”中配置；不要写入仓库配置文件。
 
 视觉验收记录见 [`design-qa.md`](design-qa.md)。
+
+开发者可从 [`docs/architecture/TECHNICAL_SOLUTION.md`](docs/architecture/TECHNICAL_SOLUTION.md) 了解完整技术栈、数据与媒体链路、关键难点、架构图和演进路线。
 
 工程排障、架构取舍与可复用经验持续记录在 [`docs/engineering/LEARNING_LOG.md`](docs/engineering/LEARNING_LOG.md)。

@@ -12,11 +12,11 @@ use crate::{
     db::{TtsPublishSnapshot, TtsSegmentPublication},
     director::{self, ProtectedTerm},
     domain::{
-        ArtifactKind, ArtifactRecord, ExportPreflight, GlossaryTerm, JobStatus, JobSummary,
-        LocalizationAnalysis, MediaArtifacts, MediaProbe, PreviewMedia, ProjectReadiness,
-        ProjectSummary, ProviderProfile, ProviderTestResult, PublishCheck, RuntimeComponent,
-        RuntimeStatus, SegmentChange, SegmentRecord, TtsCatalog, TtsFitProgress, TtsFitResult,
-        TtsPreviewAudio, TtsRunResult, TtsSegmentFailure, TtsStyleDescriptor, TtsVoiceDescriptor,
+        ArtifactKind, ArtifactRecord, ExportPreflight, GlossaryTerm, JobStage, JobStatus,
+        JobSummary, LocalizationAnalysis, MediaArtifacts, MediaProbe, PreviewMedia, ProjectSummary,
+        ProviderProfile, ProviderTestResult, PublishCheck, RuntimeComponent, RuntimeStatus,
+        SegmentChange, SegmentRecord, TtsCatalog, TtsFitProgress, TtsFitResult, TtsPreviewAudio,
+        TtsRunResult, TtsSegmentFailure, TtsStyleDescriptor, TtsVoiceDescriptor,
     },
     error::AppError,
     script::{ProtectedKind, ScriptDocumentV1},
@@ -25,6 +25,7 @@ use crate::{
         IflytekSuperTtsConfig, SynthesisRequest, SystemTtsAdapter, TtsProviderAdapter,
         TtsSecretBundle,
     },
+    workflow::WorkflowStore,
     AppState,
 };
 
@@ -99,6 +100,7 @@ struct TtsPipelineOutcome {
     failed_segments: Vec<TtsSegmentFailure>,
     affected_segment_ids: Vec<String>,
     synthesis_unit_count: usize,
+    cache_hit_unit_count: usize,
 }
 
 fn non_retryable_tts_error(error: &AppError) -> Option<AppError> {
@@ -303,12 +305,15 @@ pub async fn media_prepare(
     project_id: String,
     job_id: String,
 ) -> Result<MediaArtifacts, AppError> {
-    let source_path = {
+    let (source_path, audio_mode, source_fingerprint) = {
         let database = state.database.lock().expect("database mutex poisoned");
         let project = database.get_project(&project_id)?;
         let source = project
             .source_path
             .ok_or_else(|| AppError::Validation("项目尚未关联视频".into()))?;
+        let source_fingerprint = project
+            .source_fingerprint
+            .ok_or_else(|| AppError::Validation("项目源视频指纹缺失，请重新导入".into()))?;
         let current = database.get_job(&job_id)?;
         if matches!(
             current.status,
@@ -319,9 +324,9 @@ pub async fn media_prepare(
             database.requeue_completed_job(&job_id)?;
         }
         database.start_job(&job_id)?;
-        database.checkpoint_job(&job_id, "audio_extract", 3, "media:started")?;
+        database.checkpoint_job(&job_id, JobStage::AudioExtract, 3, "media:started")?;
         emit_job_state(&app, &database.get_job(&job_id)?);
-        source
+        (source, project.audio_mode, source_fingerprint)
     };
     let root = app
         .path()
@@ -335,6 +340,8 @@ pub async fn media_prepare(
             &worker_project_id,
             &PathBuf::from(source_path),
             &root,
+            &audio_mode,
+            &source_fingerprint,
             |stage, progress, checkpoint| {
                 let state = worker_app.state::<AppState>();
                 let database = state.database.lock().expect("database mutex poisoned");
@@ -353,7 +360,7 @@ pub async fn media_prepare(
             database.set_artifact_dir(&project_id, &artifacts.artifact_dir)?;
             database.checkpoint_job(
                 &job_id,
-                "asr",
+                JobStage::Asr,
                 15,
                 &format!("media:{}", artifacts.artifact_dir),
             )?;
@@ -387,9 +394,11 @@ pub async fn preview_media(
             .clone()
             .ok_or_else(|| AppError::Media("请先完成媒体准备".into()))?,
     );
-    tauri::async_runtime::spawn_blocking(move || crate::media::resolve_preview(&artifact_dir))
-        .await
-        .map_err(|error| AppError::Media(error.to_string()))?
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::media::resolve_preview(&artifact_dir, &project.audio_mode)
+    })
+    .await
+    .map_err(|error| AppError::Media(error.to_string()))?
 }
 
 #[tauri::command]
@@ -450,7 +459,7 @@ pub fn job_enqueue(
     let job = JobSummary {
         id: Uuid::new_v4().to_string(),
         project_id,
-        stage: "media_check".into(),
+        stage: JobStage::MediaCheck,
         progress: 0,
         status: JobStatus::Queued,
         checkpoint: None,
@@ -491,14 +500,6 @@ pub fn job_delete(state: State<'_, AppState>, id: String) -> Result<(), AppError
 }
 
 #[tauri::command]
-pub fn job_start(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), AppError> {
-    let database = state.database.lock().expect("database mutex poisoned");
-    database.start_job(&id)?;
-    emit_job_state(&app, &database.get_job(&id)?);
-    Ok(())
-}
-
-#[tauri::command]
 pub fn job_pause(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -509,19 +510,6 @@ pub fn job_pause(
         .lock()
         .expect("database mutex poisoned")
         .transition_job(&id, JobStatus::Paused)?;
-    emit_job_state(&app, &job);
-    Ok(job)
-}
-
-#[tauri::command]
-pub fn job_resume(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<JobSummary, AppError> {
-    let database = state.database.lock().expect("database mutex poisoned");
-    database.start_job(&id)?;
-    let job = database.get_job(&id)?;
     emit_job_state(&app, &job);
     Ok(job)
 }
@@ -541,34 +529,6 @@ pub fn job_cancel(
     Ok(job)
 }
 
-#[tauri::command]
-pub fn job_retry(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<JobSummary, AppError> {
-    let database = state.database.lock().expect("database mutex poisoned");
-    database.transition_job(&id, JobStatus::Queued)?;
-    let job = database.get_job(&id)?;
-    emit_job_state(&app, &job);
-    Ok(job)
-}
-
-#[tauri::command]
-pub fn job_checkpoint(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-    stage: String,
-    progress: u8,
-    checkpoint: String,
-) -> Result<(), AppError> {
-    let database = state.database.lock().expect("database mutex poisoned");
-    database.checkpoint_job(&id, &stage, progress, &checkpoint)?;
-    emit_job_state(&app, &database.get_job(&id)?);
-    Ok(())
-}
-
 fn emit_job_state(app: &AppHandle, job: &JobSummary) {
     let _ = app.emit("job://state", job);
 }
@@ -577,11 +537,14 @@ fn emit_tts_fit_progress(app: &AppHandle, progress: TtsFitProgress) {
     let _ = app.emit("tts-fit://progress", progress);
 }
 
-fn export_preflight_for_segments(segments: &[SegmentRecord]) -> ExportPreflight {
-    let blocking_segment_ids = segments
+pub(crate) fn export_preflight_for_segments(segments: &[SegmentRecord]) -> ExportPreflight {
+    let blocking_segments = segments
         .iter()
         .filter(|segment| !crate::localization::is_non_speech_text(&segment.source_text))
         .filter(|segment| segment.tts_state != "ready" && segment.status != "warning")
+        .collect::<Vec<_>>();
+    let blocking_segment_ids = blocking_segments
+        .iter()
         .map(|segment| segment.id.clone())
         .collect::<Vec<_>>();
     let warning_segment_ids = segments
@@ -591,15 +554,15 @@ fn export_preflight_for_segments(segments: &[SegmentRecord]) -> ExportPreflight 
         .map(|segment| segment.id.clone())
         .collect::<Vec<_>>();
     let mut checks = publish_checks_for_segments(segments);
-    for segment_id in &blocking_segment_ids {
+    for segment in blocking_segments {
         checks.push(PublishCheck {
             code: "tts_not_ready".into(),
             severity: "blocking".into(),
-            source_range: None,
+            source_range: Some([segment.start_ms, segment.end_ms]),
             output_range: None,
-            scene_id: None,
-            message: format!("片段 {segment_id} 尚未成功生成中文配音"),
-            suggested_action: Some("重新生成失败片段".into()),
+            scene_id: Some(segment.id.clone()),
+            message: format!("第 {} 段尚未成功生成中文配音", segment.ordinal + 1),
+            suggested_action: Some("定位到这一段并重新生成所在语音块".into()),
         });
     }
     let blocking_check_count = checks
@@ -632,6 +595,37 @@ fn export_preflight_for_segments(segments: &[SegmentRecord]) -> ExportPreflight 
     }
 }
 
+fn apply_safe_background_preflight(project: &ProjectSummary, preflight: &mut ExportPreflight) {
+    if project.audio_mode != "separate" {
+        return;
+    }
+    let ready = project
+        .artifact_dir
+        .as_deref()
+        .zip(project.source_fingerprint.as_deref())
+        .is_some_and(|(artifact_dir, fingerprint)| {
+            crate::media::safe_background_is_ready(
+                PathBuf::from(artifact_dir).as_path(),
+                fingerprint,
+            )
+        });
+    if ready {
+        return;
+    }
+    preflight.checks.push(PublishCheck {
+        code: "safe_background_not_ready".into(),
+        severity: "blocking".into(),
+        source_range: None,
+        output_range: None,
+        scene_id: None,
+        message: "安全背景轨缺失或已过期；为避免残留英文，不能导出".into(),
+        suggested_action: Some("重新运行媒体准备，完成本地人声分离".into()),
+    });
+    preflight.blocking_count += 1;
+    preflight.can_export = false;
+    preflight.message = "安全模式尚未生成有效的背景与音效轨，处理后才能导出".into();
+}
+
 fn publish_checks_for_segments(segments: &[SegmentRecord]) -> Vec<PublishCheck> {
     let mut checks = Vec::new();
     for segment in segments {
@@ -646,7 +640,7 @@ fn publish_checks_for_segments(segments: &[SegmentRecord]) -> Vec<PublishCheck> 
                 output_range: None,
                 scene_id: None,
                 message: format!(
-                    "“{}”已识别为非语言事件，将保留原声且不送入 TTS",
+                    "“{}”已识别为非语言事件，不会送入 TTS；对应声音按所选原声模式处理",
                     segment.source_text.trim()
                 ),
                 suggested_action: Some("如识别有误，可在片段文本中改回口播内容".into()),
@@ -701,58 +695,15 @@ fn publish_checks_for_segments(segments: &[SegmentRecord]) -> Vec<PublishCheck> 
 }
 
 #[tauri::command]
-pub fn project_readiness(
-    state: State<'_, AppState>,
-    project_id: String,
-) -> Result<ProjectReadiness, AppError> {
-    let database = state.database.lock().expect("database mutex poisoned");
-    let project = database.get_project(&project_id)?;
-    let segments = database.list_segments(&project_id)?;
-    let preflight = export_preflight_for_segments(&segments);
-    let latest_job = database
-        .list_jobs()?
-        .into_iter()
-        .find(|job| job.project_id == project_id);
-    let running = latest_job
-        .as_ref()
-        .is_some_and(|job| job.status == JobStatus::Running);
-    let failed = segments.iter().any(|segment| segment.tts_state == "failed")
-        || latest_job
-            .as_ref()
-            .is_some_and(|job| job.status == JobStatus::Failed);
-    let (phase, next_action) = if running {
-        ("processing", "等待当前处理完成")
-    } else if failed {
-        ("failed", "重试失败片段")
-    } else if preflight.blocking_count > 0 {
-        ("review", "完成尚未生成的配音")
-    } else if preflight.warning_count > 0 {
-        ("export_warning", "自动修复时长问题或知情导出")
-    } else if segments.is_empty() {
-        ("processing", "等待识别与翻译完成")
-    } else {
-        ("ready", "导出中文版本")
-    };
-    Ok(ProjectReadiness {
-        phase: phase.into(),
-        blocking_count: preflight.blocking_count,
-        warning_count: preflight.warning_count,
-        can_export: preflight.can_export,
-        next_action: next_action.into(),
-        progress: latest_job.map_or(project.progress, |job| job.progress),
-    })
-}
-
-#[tauri::command]
 pub fn export_preflight(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<ExportPreflight, AppError> {
     let database = state.database.lock().expect("database mutex poisoned");
-    let _ = database.get_project(&project_id)?;
-    Ok(export_preflight_for_segments(
-        &database.list_segments(&project_id)?,
-    ))
+    let project = database.get_project(&project_id)?;
+    let mut preflight = export_preflight_for_segments(&database.list_segments(&project_id)?);
+    apply_safe_background_preflight(&project, &mut preflight);
+    Ok(preflight)
 }
 
 #[tauri::command]
@@ -1102,7 +1053,7 @@ pub async fn asr_run(
             db.transition_job(&job_id, JobStatus::Queued)?;
         }
         db.start_job(&job_id)?;
-        db.checkpoint_job(&job_id, "asr", 16, "asr:started")?;
+        db.checkpoint_job(&job_id, JobStage::Asr, 16, "asr:started")?;
         emit_job_state(&app, &db.get_job(&job_id)?);
     }
     let worker_project = project_id.clone();
@@ -1118,7 +1069,7 @@ pub async fn asr_run(
             db.replace_asr_segments(&project_id, &segments)?;
             db.checkpoint_job(
                 &job_id,
-                "glossary",
+                JobStage::Glossary,
                 35,
                 &format!("asr:{}-segments", segments.len()),
             )?;
@@ -1187,7 +1138,7 @@ pub async fn translation_run(
             database.transition_job(&job_id, JobStatus::Queued)?;
         }
         database.start_job(&job_id)?;
-        database.checkpoint_job(&job_id, "translation", 36, "translation:started")?;
+        database.checkpoint_job(&job_id, JobStage::Translation, 36, "translation:started")?;
         emit_job_state(&app, &database.get_job(&job_id)?);
     }
     const BATCH_SIZE: usize = 8;
@@ -1211,7 +1162,7 @@ pub async fn translation_run(
                 &project.tts_style,
                 project.tts_director_enabled,
             )?;
-            database.checkpoint_job(&job_id, "tts", 62, "director:complete")?;
+            database.checkpoint_job(&job_id, JobStage::Tts, 62, "director:complete")?;
             let target = if project.workflow_mode == "review" {
                 JobStatus::WaitingUser
             } else {
@@ -1221,9 +1172,6 @@ pub async fn translation_run(
             emit_job_state(&app, &job);
             database.list_segments(&project_id)?
         };
-        if project.workflow_mode != "review" {
-            tts_run(app, state, project_id, job_id, None).await?;
-        }
         return Ok(result);
     }
     let total_batches = pending.len().div_ceil(BATCH_SIZE);
@@ -1245,7 +1193,7 @@ pub async fn translation_run(
         let progress = 36 + (((index + 1) * 20 / total_batches.max(1)) as u8);
         database.checkpoint_job(
             &job_id,
-            "translation",
+            JobStage::Translation,
             progress,
             &format!("translation:batch-{}/{}", index + 1, total_batches),
         )?;
@@ -1253,13 +1201,13 @@ pub async fn translation_run(
     }
     let result = {
         let database = state.database.lock().expect("database mutex poisoned");
-        database.checkpoint_job(&job_id, "script_director", 58, "director:started")?;
+        database.checkpoint_job(&job_id, JobStage::ScriptDirector, 58, "director:started")?;
         // The scene rewriter has already produced the final spoken copy. Running
         // the per-segment director here would rewrite every script a second time,
         // serialize 136 database updates, and reintroduce sentence-level delivery
         // boundaries. Semantic mode instead supplies one continuity instruction
         // to each anchored synthesis block below.
-        database.checkpoint_job(&job_id, "tts", 62, "director:complete")?;
+        database.checkpoint_job(&job_id, JobStage::Tts, 62, "director:complete")?;
         let target = if project.workflow_mode == "review" {
             JobStatus::WaitingUser
         } else {
@@ -1269,9 +1217,6 @@ pub async fn translation_run(
         emit_job_state(&app, &job);
         database.list_segments(&project_id)?
     };
-    if project.workflow_mode != "review" {
-        tts_run(app, state, project_id, job_id, None).await?;
-    }
     Ok(result)
 }
 
@@ -1339,7 +1284,7 @@ pub async fn translation_rebuild(
         let database = state.database.lock().expect("database mutex poisoned");
         let job = database.get_job(&job_id)?;
         if job.status == JobStatus::Succeeded {
-            database.reopen_job(&job_id, "translation", 36, "translation:rebuild")?;
+            database.reopen_job(&job_id, JobStage::Translation, 36, "translation:rebuild")?;
         } else if matches!(job.status, JobStatus::WaitingUser | JobStatus::Paused) {
             database.transition_job(&job_id, JobStatus::Queued)?;
         }
@@ -1413,7 +1358,7 @@ pub async fn semantic_narration_run(
             .ok_or_else(|| AppError::Provider("语义旁白需要先配置阿里百炼翻译服务".into()))?;
         let resume_from_rewrite = database.get_job(&job_id).ok().is_some_and(|job| {
             job.checkpoint.as_deref() == Some("semantic:rewrite-complete")
-                || (job.stage == "export"
+                || (job.stage == JobStage::Export
                     && job.progress >= 80
                     && job
                         .checkpoint
@@ -1454,7 +1399,7 @@ pub async fn semantic_narration_run(
         database.start_job(&job_id)?;
         database.checkpoint_job(
             &job_id,
-            "semantic_narration",
+            JobStage::SemanticNarration,
             57,
             &format!("semantic:scene-0/{scene_count}"),
         )?;
@@ -1510,7 +1455,7 @@ pub async fn semantic_narration_run(
         let progress = 57 + (((scene_index + 1) * 5 / scenes.len().max(1)) as u8);
         database.checkpoint_job(
             &job_id,
-            "semantic_narration",
+            JobStage::SemanticNarration,
             progress,
             &format!("semantic:scene-{}/{}", scene_index + 1, scenes.len()),
         )?;
@@ -1524,12 +1469,12 @@ pub async fn semantic_narration_run(
         // Semantic blocks already carry one block-level delivery instruction.
         // Rebuilding 136 per-row director documents here adds no audible value
         // and can stall the UI before the first TTS progress event.
-        database.checkpoint_job(&job_id, "tts", 62, "semantic:rewrite-complete")?;
+        database.checkpoint_job(&job_id, JobStage::Tts, 62, "semantic:rewrite-complete")?;
         emit_job_state(&app, &database.get_job(&job_id)?);
     }
     {
         let database = state.database.lock().expect("database mutex poisoned");
-        database.handoff_running_job(&job_id, "tts", 62, "semantic:rewrite-complete")?;
+        database.handoff_running_job(&job_id, JobStage::Tts, 62, "semantic:rewrite-complete")?;
     }
     tts_run(app, state, project_id, job_id, None).await
 }
@@ -1608,11 +1553,13 @@ pub async fn tts_run(
             .clone()
             .ok_or_else(|| AppError::Media("请先完成媒体准备".into()))?,
     );
+    let published_track = artifact_dir.join("chinese-voice.wav");
+    let track_revision_before = file_revision(&published_track);
     {
         let database = state.database.lock().expect("database mutex poisoned");
         database.prepare_tts_job(&job_id)?;
         database.start_job(&job_id)?;
-        database.checkpoint_job(&job_id, "tts", 63, "tts:started")?;
+        database.checkpoint_job(&job_id, JobStage::Tts, 63, "tts:started")?;
         emit_job_state(&app, &database.get_job(&job_id)?);
     }
     let duration_ms = project
@@ -1688,8 +1635,9 @@ pub async fn tts_run(
                         ));
                     }
                 }
-                let published_track = artifact_dir.join("chinese-voice.wav");
-                let preview_media = if published_track.is_file() {
+                let revision = file_revision(&published_track);
+                let track_published = revision > 0 && revision != track_revision_before;
+                let preview_media = if track_published {
                     let preview_lock = project_preview_lock(&state, &project_id);
                     match tauri::async_runtime::spawn_blocking({
                         let artifact_dir = artifact_dir.clone();
@@ -1713,14 +1661,25 @@ pub async fn tts_run(
                     None
                 };
                 let database = state.database.lock().expect("database mutex poisoned");
-                database.checkpoint_job(
-                    &job_id,
-                    "export",
-                    80,
-                    &format!("tts:{}", published_track.display()),
-                )?;
-                let needs_attention =
-                    !output.warning_ids.is_empty() || !output.failed_segments.is_empty();
+                let checkpoint = format!(
+                    "tts:{}|cache:{}/{}",
+                    if track_published {
+                        published_track.to_string_lossy().into_owned()
+                    } else {
+                        "partial".into()
+                    },
+                    output.cache_hit_unit_count,
+                    output.synthesis_unit_count
+                );
+                if track_published {
+                    database.checkpoint_job(&job_id, JobStage::Export, 80, &checkpoint)?;
+                } else {
+                    let progress = database.get_job(&job_id)?.progress;
+                    database.checkpoint_job(&job_id, JobStage::Tts, progress, &checkpoint)?;
+                }
+                let needs_attention = !track_published
+                    || !output.warning_ids.is_empty()
+                    || !output.failed_segments.is_empty();
                 let status = if needs_attention {
                     JobStatus::WaitingUser
                 } else {
@@ -1728,12 +1687,12 @@ pub async fn tts_run(
                 };
                 let job = database.transition_job(&job_id, status)?;
                 emit_job_state(&app, &job);
-                let revision = file_revision(&published_track);
                 Ok(TtsRunResult {
                     warning_ids: output.warning_ids,
                     failed_segments: output.failed_segments,
                     affected_segment_ids: output.affected_segment_ids,
                     synthesis_unit_count: output.synthesis_unit_count,
+                    cache_hit_unit_count: output.cache_hit_unit_count,
                     track_revision: revision,
                     preview_media,
                 })
@@ -1773,7 +1732,7 @@ fn update_tts_progress_kind(app: &AppHandle, job_id: &str, done: usize, total: u
     if database
         .checkpoint_job(
             job_id,
-            "tts",
+            JobStage::Tts,
             percent,
             &format!("tts:{unit}-{done}/{total}"),
         )
@@ -1815,10 +1774,12 @@ async fn synthesize_system_segments(
     let mut segment_updates = Vec::<TtsSegmentPublication>::new();
     let mut segment_artifacts = Vec::<ArtifactRecord>::new();
     let mut warning_ids = Vec::new();
+    let mut cache_hit_unit_count = 0;
     for (index, segment) in selected_segments.iter().enumerate() {
         let settings_hash = system_tts_settings_hash(project, segment);
         let target = system_segment_cache_path(&tts_dir, segment, &settings_hash);
         let ready = reusable_system_clip(&tts_dir, project, segment).is_some();
+        cache_hit_unit_count += usize::from(ready);
         let (actual_ms, content_hash, new_artifact) = if ready {
             (
                 crate::tts::duration_ms_of(&target)?,
@@ -1938,6 +1899,7 @@ async fn synthesize_system_segments(
                 .map(|segment| segment.id.clone())
                 .collect(),
             synthesis_unit_count: selected_segments.len(),
+            cache_hit_unit_count,
         });
     }
 
@@ -1981,6 +1943,7 @@ async fn synthesize_system_segments(
             .map(|segment| segment.id.clone())
             .collect(),
         synthesis_unit_count: selected_segments.len(),
+        cache_hit_unit_count,
     })
 }
 
@@ -2166,6 +2129,7 @@ async fn synthesize_cloud_semantic(
     let mut inputs = Vec::<(PathBuf, i64)>::new();
     let run_id = Uuid::new_v4().to_string();
     let mut completed_scenes = 0;
+    let mut cache_hit_unit_count = 0;
     update_tts_progress_kind(app, job_id, 0, selected_scene_count, "scene");
 
     for (scene_index, scene) in scenes.iter().enumerate() {
@@ -2250,14 +2214,10 @@ async fn synthesize_cloud_semantic(
                 ))
             })
             .collect::<Vec<_>>();
-        let ready = scene.beats.iter().all(|beat| {
-            beat.segments.iter().all(|segment| {
-                segment.tts_state == "ready"
-                    && segment.tts_settings_hash.as_deref() == Some(settings_hash.as_str())
-            })
-        }) && targets
+        let ready = targets
             .iter()
             .all(|target| target.metadata().is_ok_and(|metadata| metadata.len() > 44));
+        cache_hit_unit_count += usize::from(selected && ready);
         if !selected && !ready {
             return Err(AppError::Validation(
                 "局部生成前需先完成一次语义旁白整片配音，以建立场景节拍缓存".into(),
@@ -2438,6 +2398,7 @@ async fn synthesize_cloud_semantic(
             failed_segments,
             affected_segment_ids,
             synthesis_unit_count: selected_scene_count,
+            cache_hit_unit_count,
         });
     }
     let expected_beats = scenes.iter().map(|scene| scene.beats.len()).sum::<usize>();
@@ -2464,6 +2425,7 @@ async fn synthesize_cloud_semantic(
         failed_segments,
         affected_segment_ids,
         synthesis_unit_count: selected_scene_count,
+        cache_hit_unit_count,
     })
 }
 
@@ -2526,6 +2488,7 @@ async fn synthesize_cloud_narration(
     let mut inputs = Vec::<(PathBuf, i64)>::new();
     let run_id = Uuid::new_v4().to_string();
     let mut completed_chapters = 0;
+    let mut cache_hit_unit_count = 0;
 
     update_tts_progress_kind(app, job_id, 0, selected_chapter_count, "chapter");
 
@@ -2595,10 +2558,8 @@ async fn synthesize_cloud_narration(
             first.id,
             &settings_hash[..24]
         ));
-        let ready = chapter.segments.iter().all(|segment| {
-            segment.tts_state == "ready"
-                && segment.tts_settings_hash.as_deref() == Some(settings_hash.as_str())
-        }) && target.metadata().is_ok_and(|metadata| metadata.len() > 44);
+        let ready = target.metadata().is_ok_and(|metadata| metadata.len() > 44);
+        cache_hit_unit_count += usize::from(selected && ready);
         if !selected && !ready {
             return Err(AppError::Validation(
                 "局部生成前需先完成一次连续旁白整片配音，以建立可复用章节缓存".into(),
@@ -2763,6 +2724,7 @@ async fn synthesize_cloud_narration(
             failed_segments,
             affected_segment_ids,
             synthesis_unit_count: selected_chapter_count,
+            cache_hit_unit_count,
         });
     }
     if inputs.len() != chapters.len() {
@@ -2788,6 +2750,7 @@ async fn synthesize_cloud_narration(
         failed_segments,
         affected_segment_ids,
         synthesis_unit_count: selected_chapter_count,
+        cache_hit_unit_count,
     })
 }
 
@@ -2889,6 +2852,8 @@ async fn synthesize_cloud_blocks(
     let mut inputs = Vec::<(PathBuf, i64)>::new();
     let run_id = Uuid::new_v4().to_string();
     let mut completed_blocks = 0;
+    let mut cache_hit_unit_count = 0;
+    let mut missing_unselected_blocks = 0;
     let effective_sync_mode = if project.tts_sync_mode == "semantic" {
         "semantic"
     } else {
@@ -2964,18 +2929,14 @@ async fn synthesize_cloud_blocks(
         ));
         let target = tts_dir.join(format!("block-{}-{}.wav", first.id, &settings_hash[..32]));
         let target_ready = target.metadata().is_ok_and(|metadata| metadata.len() > 44);
-        let ready = target_ready
-            && (effective_sync_mode == "semantic"
-                || block.segments.iter().all(|segment| {
-                    segment.tts_state == "ready"
-                        && segment.tts_settings_hash.as_deref() == Some(settings_hash.as_str())
-                }));
+        let ready = target_ready;
+        cache_hit_unit_count += usize::from(selected && ready);
         if !selected && !ready {
-            return Err(AppError::Validation(
-                "局部生成前需先完成一次整片配音，以建立可复用的连续语音块".into(),
-            ));
+            missing_unselected_blocks += 1;
+            continue;
         }
 
+        let update_start = segment_updates.len();
         let (actual_ms, content_hash, new_artifact) = if ready {
             (
                 crate::tts::duration_ms_of(&target)?,
@@ -3054,6 +3015,15 @@ async fn synthesize_cloud_blocks(
                         display_status: "warning".into(),
                     });
                 }
+                {
+                    let database = state.database.lock().expect("database mutex poisoned");
+                    database.commit_tts_publication(
+                        job_id,
+                        publish_snapshot,
+                        &segment_updates[update_start..],
+                        &[],
+                    )?;
+                }
                 completed_blocks += usize::from(selected);
                 if selected {
                     update_tts_progress_kind(
@@ -3116,8 +3086,7 @@ async fn synthesize_cloud_blocks(
                     display_status: if too_long { "warning" } else { "ready" }.into(),
                 });
             }
-            if new_artifact && !too_long {
-                segment_artifacts.push(ArtifactRecord {
+            let block_artifact = (new_artifact && !too_long).then(|| ArtifactRecord {
                     id: format!("tts-block-{}-{}", first.id, &settings_hash[..16]), project_id: project.id.clone(), segment_id: None,
                     kind: if effective_sync_mode == "semantic" { "tts_semantic_anchored" } else { "tts_block_aligned" }.into(), path: target.to_string_lossy().into_owned(), content_hash,
                     dependency_hash: settings_hash.clone(), cache_key: Some(settings_hash.clone()), revision: 1, status: "ready".into(),
@@ -3129,6 +3098,15 @@ async fn synthesize_cloud_blocks(
                         "semanticRewrite": effective_sync_mode == "semantic",
                     }).to_string(), created_at: String::new(), updated_at: String::new(),
                 });
+            {
+                let database = state.database.lock().expect("database mutex poisoned");
+                let artifacts = block_artifact.as_slice();
+                database.commit_tts_publication(
+                    job_id,
+                    publish_snapshot,
+                    &segment_updates[update_start..],
+                    artifacts,
+                )?;
             }
             completed_blocks += 1;
             update_tts_progress_kind(
@@ -3146,18 +3124,21 @@ async fn synthesize_cloud_blocks(
     }
 
     if !warning_ids.is_empty() || !failed_segments.is_empty() {
-        let database = state.database.lock().expect("database mutex poisoned");
-        database.commit_tts_publication(
-            job_id,
-            publish_snapshot,
-            &segment_updates,
-            &segment_artifacts,
-        )?;
         return Ok(TtsPipelineOutcome {
             warning_ids,
             failed_segments,
             affected_segment_ids,
             synthesis_unit_count: selected_block_count,
+            cache_hit_unit_count,
+        });
+    }
+    if missing_unselected_blocks > 0 {
+        return Ok(TtsPipelineOutcome {
+            warning_ids,
+            failed_segments,
+            affected_segment_ids,
+            synthesis_unit_count: selected_block_count,
+            cache_hit_unit_count,
         });
     }
     if inputs.len() != blocks.len() {
@@ -3184,6 +3165,7 @@ async fn synthesize_cloud_blocks(
         failed_segments,
         affected_segment_ids,
         synthesis_unit_count: selected_block_count,
+        cache_hit_unit_count,
     })
 }
 
@@ -3232,6 +3214,7 @@ async fn synthesize_cloud_segments(
     let mut segment_updates = Vec::<TtsSegmentPublication>::new();
     let mut segment_artifacts = Vec::<ArtifactRecord>::new();
     let mut failed_segments = Vec::<TtsSegmentFailure>::new();
+    let mut cache_hit_unit_count = 0;
     let run_id = Uuid::new_v4().to_string();
 
     for (index, segment) in selected_segments.iter().enumerate() {
@@ -3277,9 +3260,8 @@ async fn synthesize_cloud_segments(
                 .map_err(|error| AppError::Validation(error.to_string()))?,
         ));
         let target = tts_dir.join(format!("{}-{}.wav", segment.id, &settings_hash[..32]));
-        let ready = segment.tts_state == "ready"
-            && segment.tts_settings_hash.as_deref() == Some(settings_hash.as_str())
-            && target.metadata().is_ok_and(|metadata| metadata.len() > 44);
+        let ready = target.metadata().is_ok_and(|metadata| metadata.len() > 44);
+        cache_hit_unit_count += usize::from(ready);
         let (actual_ms, content_hash, new_artifact) = if ready {
             (
                 crate::tts::duration_ms_of(&target)?,
@@ -3471,6 +3453,7 @@ async fn synthesize_cloud_segments(
                 .map(|segment| segment.id.clone())
                 .collect(),
             synthesis_unit_count: selected_segments.len(),
+            cache_hit_unit_count,
         });
     }
     if inputs.len() < all_segments.len() && selected_ids.len() != all_segments.len() {
@@ -3504,6 +3487,7 @@ async fn synthesize_cloud_segments(
             .map(|segment| segment.id.clone())
             .collect(),
         synthesis_unit_count: selected_segments.len(),
+        cache_hit_unit_count,
     })
 }
 
@@ -3516,13 +3500,16 @@ fn publish_mixed_track(
     publish_snapshot: &TtsPublishSnapshot,
     artifact_dir: &std::path::Path,
     duration_ms: i64,
-    run_id: &str,
+    _run_id: &str,
     inputs: &[(PathBuf, i64)],
     segment_updates: &[TtsSegmentPublication],
     segment_artifacts: &mut Vec<ArtifactRecord>,
 ) -> Result<(), AppError> {
     let final_track = artifact_dir.join("chinese-voice.wav");
-    let pending_track = artifact_dir.join(format!("chinese-voice.{run_id}.pending.wav"));
+    let pending_track =
+        crate::infrastructure::artifact_publisher::AtomicArtifactPublisher::stage_file(
+            &final_track,
+        )?;
     crate::tts::mix_track(inputs, duration_ms, &pending_track)?;
     let mut published_segments = all_segments.to_vec();
     for update in segment_updates {
@@ -3552,34 +3539,20 @@ fn publish_mixed_track(
         created_at: String::new(),
         updated_at: String::new(),
     });
-    let backup_track = artifact_dir.join(format!("chinese-voice.{run_id}.backup.wav"));
     let database = state.database.lock().expect("database mutex poisoned");
     database.validate_tts_publish_snapshot(job_id, publish_snapshot)?;
-    let had_previous = final_track.is_file();
-    if had_previous {
-        std::fs::rename(&final_track, &backup_track)
-            .map_err(|error| AppError::Media(format!("无法暂存旧中文音轨：{error}")))?;
-    }
-    if let Err(error) = std::fs::rename(&pending_track, &final_track) {
-        if had_previous {
-            let _ = std::fs::rename(&backup_track, &final_track);
-        }
-        return Err(AppError::Media(format!("无法原子发布中文音轨：{error}")));
-    }
-    if let Err(error) = database.commit_tts_publication(
-        job_id,
-        publish_snapshot,
-        segment_updates,
-        segment_artifacts,
-    ) {
-        let _ = std::fs::remove_file(&final_track);
-        if had_previous {
-            let _ = std::fs::rename(&backup_track, &final_track);
-        }
-        return Err(error);
-    }
-    let _ = std::fs::remove_file(&backup_track);
-    Ok(())
+    crate::infrastructure::artifact_publisher::AtomicArtifactPublisher::publish_file(
+        &pending_track,
+        &final_track,
+        || {
+            database.commit_tts_publication(
+                job_id,
+                publish_snapshot,
+                segment_updates,
+                segment_artifacts,
+            )
+        },
+    )
 }
 
 fn file_sha256(path: &std::path::Path) -> Result<String, AppError> {
@@ -3630,8 +3603,10 @@ fn system_tts_settings_hash(project: &ProjectSummary, segment: &SegmentRecord) -
 
     let value = serde_json::json!({
         "provider": "system",
-        "projectTtsRevision": project.tts_settings_revision,
-        "voice": "Tingting",
+        "voice": project.tts_voice_id.as_deref().unwrap_or("Tingting"),
+        "style": project.tts_style,
+        "settings": project.tts_settings_json,
+        "overrides": segment.tts_overrides_json,
         "rate": 200,
         "segmentId": segment.id,
         "scriptRevision": segment.script_revision,
@@ -3692,10 +3667,10 @@ fn reusable_system_clip(
 ) -> Option<PathBuf> {
     let settings_hash = system_tts_settings_hash(project, segment);
     let target = system_segment_cache_path(tts_dir, segment, &settings_hash);
-    (segment.tts_state == "ready"
-        && segment.tts_settings_hash.as_deref() == Some(settings_hash.as_str())
-        && target.metadata().is_ok_and(|metadata| metadata.len() > 44))
-    .then_some(target)
+    target
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() > 44)
+        .then_some(target)
 }
 
 fn validate_system_partial_cache(
@@ -3978,7 +3953,7 @@ pub async fn tts_fit_warnings(
         let database = state.database.lock().expect("database mutex poisoned");
         let current = database.get_job(&job_id)?;
         if current.status == JobStatus::Succeeded {
-            database.reopen_job(&job_id, "tts", 63, "tts:fit-started")?;
+            database.reopen_job(&job_id, JobStage::Tts, 63, "tts:fit-started")?;
         } else if matches!(
             current.status,
             JobStatus::Paused | JobStatus::Failed | JobStatus::WaitingUser
@@ -3986,7 +3961,7 @@ pub async fn tts_fit_warnings(
             database.transition_job(&job_id, JobStatus::Queued)?;
         }
         database.start_job(&job_id)?;
-        database.checkpoint_job(&job_id, "tts", 63, "tts:fit-started")?;
+        database.checkpoint_job(&job_id, JobStage::Tts, 63, "tts:fit-started")?;
         emit_job_state(&app, &database.get_job(&job_id)?);
     }
     for attempt in 0..2 {
@@ -4083,7 +4058,7 @@ pub async fn tts_fit_warnings(
             let progress = 63 + (done * 16 / total.max(1)) as u8;
             database.checkpoint_job(
                 &job_id,
-                "tts",
+                JobStage::Tts,
                 progress,
                 &format!("tts:compress-{}/{total}", done),
             )?;
@@ -4255,7 +4230,8 @@ pub async fn export_start(
         let database = state.database.lock().expect("database mutex poisoned");
         let project = database.get_project(&project_id)?;
         let segments = database.list_segments(&project_id)?;
-        let preflight = export_preflight_for_segments(&segments);
+        let mut preflight = export_preflight_for_segments(&segments);
+        apply_safe_background_preflight(&project, &mut preflight);
         if !preflight.can_export {
             return Err(AppError::Validation(preflight.message));
         }
@@ -4279,14 +4255,17 @@ pub async fn export_start(
     {
         let database = state.database.lock().expect("database mutex poisoned");
         let current = database.get_job(&job_id)?;
-        if matches!(
-            current.status,
-            JobStatus::Paused | JobStatus::Failed | JobStatus::WaitingUser
-        ) {
-            database.transition_job(&job_id, JobStatus::Queued)?;
+        match current.status {
+            JobStatus::Succeeded => {
+                database.reopen_job(&job_id, JobStage::Export, 80, "export:queued")?;
+            }
+            JobStatus::Paused | JobStatus::Failed | JobStatus::WaitingUser => {
+                database.transition_job(&job_id, JobStatus::Queued)?;
+            }
+            _ => {}
         }
         database.start_job(&job_id)?;
-        database.checkpoint_job(&job_id, "export", 82, "export:started")?;
+        database.checkpoint_job(&job_id, JobStage::Export, 82, "export:started")?;
         emit_job_state(&app, &database.get_job(&job_id)?);
     }
     let output = PathBuf::from(output_directory);
@@ -4308,11 +4287,30 @@ pub async fn export_start(
             let database = state.database.lock().expect("database mutex poisoned");
             database.checkpoint_job(
                 &job_id,
-                "export",
+                JobStage::Export,
                 100,
                 &format!("export:{}", value.directory),
             )?;
             let job = database.transition_job(&job_id, JobStatus::Succeeded)?;
+            drop(database);
+            if let Some(run) = state.workflow_store.find_run_by_legacy_job_id(&job_id)? {
+                let awaiting_export = run.state
+                    == crate::workflow::WorkflowRunState::WaitingForInput
+                    && run.current_node_id.as_deref()
+                        == Some(crate::application::production_workflow::EXPORT_NODE_ID);
+                if awaiting_export {
+                    // The files and legacy job are already committed. A workflow
+                    // projection failure must never turn that durable success into
+                    // a user-visible export failure.
+                    let _ = state.workflow_store.complete_external_node(
+                        &job_id,
+                        crate::application::production_workflow::EXPORT_NODE_ID,
+                        crate::application::production_workflow::EXPORT_NODE_VERSION,
+                        &[value.video_path.clone(), value.audio_path.clone()],
+                        &format!("export:{}", value.directory),
+                    );
+                }
+            }
             emit_job_state(&app, &job);
             Ok(value)
         }
@@ -4610,6 +4608,14 @@ pub fn provider_save(
                 })
         })
         .unwrap_or_else(|| kind.clone());
+    let synthesis_config_changed = existing.as_ref().is_some_and(|profile| {
+        profile.kind != kind
+            || profile.public_config_json != public_config_json
+            || profile.driver != driver
+            || secret_to_save
+                .as_deref()
+                .is_some_and(|value| previous_secret.as_deref() != Some(value))
+    });
     let profile = ProviderProfile {
         id,
         kind,
@@ -4617,9 +4623,13 @@ pub fn provider_save(
         public_config_json,
         credential_ref: credential_ref.clone(),
         driver,
-        revision: existing
-            .as_ref()
-            .map_or(1, |profile| profile.revision.saturating_add(1)),
+        revision: existing.as_ref().map_or(1, |profile| {
+            if synthesis_config_changed {
+                profile.revision.saturating_add(1)
+            } else {
+                profile.revision
+            }
+        }),
         secret_bundle_ref: credential_ref,
         updated_at: String::new(),
     };
@@ -4899,6 +4909,9 @@ pub fn runtime_catalog(app: AppHandle) -> Vec<RuntimeComponent> {
     ]
     .iter()
     .any(|path| std::path::Path::new(path).is_file());
+    let separation_installed = app_data
+        .as_deref()
+        .is_some_and(crate::media::separation_runtime_installed);
     vec![
         RuntimeComponent {
             id: "system-tts".into(),
@@ -4944,13 +4957,28 @@ pub fn runtime_catalog(app: AppHandle) -> Vec<RuntimeComponent> {
         RuntimeComponent {
             id: "whisper-small-en".into(),
             name: "Whisper small.en".into(),
-            architecture,
+            architecture: architecture.clone(),
             version: "ggml-small.en".into(),
             installed: model_installed,
             sha256: Some("manifest-pending".into()),
             license: "MIT model distribution notice required".into(),
             size_bytes: Some(466 * 1024 * 1024),
             status: if model_installed {
+                RuntimeStatus::Installed
+            } else {
+                RuntimeStatus::Available
+            },
+        },
+        RuntimeComponent {
+            id: "audio-separator".into(),
+            name: "安全模式本地人声分离".into(),
+            architecture,
+            version: "0.44.5 · UVR-MDX-NET-Inst_HQ_3".into(),
+            installed: separation_installed,
+            sha256: Some("app-managed-runtime".into()),
+            license: "MIT runtime · model license shown on download".into(),
+            size_bytes: None,
+            status: if separation_installed {
                 RuntimeStatus::Installed
             } else {
                 RuntimeStatus::Available
@@ -5048,16 +5076,14 @@ mod tests {
     }
 
     #[test]
-    fn system_partial_run_requires_only_unselected_clips_to_be_reusable() {
+    fn system_partial_run_restores_a_stale_unselected_clip_from_disk_cache() {
         let project = system_project();
         let selected = system_segment("s1", 0);
-        let mut reusable = system_segment("s2", 1);
+        let reusable = system_segment("s2", 1);
         let cache_root =
             std::env::temp_dir().join(format!("yisheng-system-tts-cache-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&cache_root).unwrap();
         let settings_hash = system_tts_settings_hash(&project, &reusable);
-        reusable.tts_state = "ready".into();
-        reusable.tts_settings_hash = Some(settings_hash.clone());
         let cached = system_segment_cache_path(&cache_root, &reusable, &settings_hash);
         std::fs::write(&cached, [0_u8; 45]).unwrap();
         let segments = [selected, reusable];
@@ -5075,6 +5101,24 @@ mod tests {
         assert!(error.contains("先完成一次全片配音"));
         assert!(error.contains("s2"));
         std::fs::remove_dir(&cache_root).unwrap();
+    }
+
+    #[test]
+    fn system_cache_key_is_stable_across_track_switches_but_changes_with_audio_inputs() {
+        let segment = system_segment("s1", 0);
+        let project = system_project();
+        let baseline = system_tts_settings_hash(&project, &segment);
+
+        let mut switched_away_and_back = project.clone();
+        switched_away_and_back.tts_settings_revision += 4;
+        assert_eq!(
+            baseline,
+            system_tts_settings_hash(&switched_away_and_back, &segment)
+        );
+
+        let mut changed = segment.clone();
+        changed.tts_overrides_json = r#"{"speed":1.08}"#.into();
+        assert_ne!(baseline, system_tts_settings_hash(&project, &changed));
     }
 
     #[test]
@@ -5201,6 +5245,14 @@ mod tests {
         assert!(!blocked.can_export);
         assert_eq!(blocked.blocking_count, 1);
         assert_eq!(blocked.warning_count, 0);
+        let issue = blocked
+            .checks
+            .iter()
+            .find(|check| check.code == "tts_not_ready")
+            .unwrap();
+        assert_eq!(issue.message, "第 1 段尚未成功生成中文配音");
+        assert_eq!(issue.source_range, Some([0, 1_000]));
+        assert_eq!(issue.scene_id.as_deref(), Some("ready"));
     }
 
     #[test]

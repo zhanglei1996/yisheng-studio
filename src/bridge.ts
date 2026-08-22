@@ -1,4 +1,4 @@
-import type { ExportPreflight, GlossaryTerm, LocalizationAnalysis, MediaArtifacts, MediaProbe, PersistedJob, PersistedSegment, PreviewMedia, Project, ProjectReadiness, ProviderProfile, ProviderTestResult, RuntimeComponent, ScriptDocument, TtsCatalog, TtsFitProgress, TtsFitResult, TtsPreviewAudio, TtsRunResult, TtsStyleId } from "./domain";
+import type { ExportPreflight, GlossaryTerm, LocalizationAnalysis, MediaProbe, PersistedJob, PersistedSegment, PreviewMedia, Project, ProjectReadiness, ProviderProfile, ProviderTestResult, RuntimeComponent, ScriptDocument, TtsCatalog, TtsFitProgress, TtsFitResult, TtsPreviewAudio, TtsRunResult, TtsStyleId, WorkflowIntentResult } from "./domain";
 import { projects as demoProjects } from "./fixtures";
 import { convertFileSrc } from "@tauri-apps/api/core";
 
@@ -48,6 +48,11 @@ export const desktopBridge = {
     return invoke("project_readiness", { projectId });
   },
 
+  async updateProjectAudioMode(projectId: string, audioMode: "duck" | "mute" | "separate"): Promise<Project | null> {
+    const invoke = tauriInvoke();
+    return invoke ? invoke("project_audio_mode_update", { projectId, audioMode }) : null;
+  },
+
   async createProject(name: string): Promise<{ id: string; name: string } | null> {
     const invoke = tauriInvoke();
     if (!invoke) return null;
@@ -83,11 +88,6 @@ export const desktopBridge = {
     if (invoke) await invoke("project_delete", { projectId });
   },
 
-  async prepareMedia(projectId: string, jobId: string): Promise<MediaArtifacts | null> {
-    const invoke = tauriInvoke();
-    return invoke ? invoke("media_prepare", { projectId, jobId }) : null;
-  },
-
   async resolvePreviewMedia(projectId: string): Promise<PreviewMedia | null> {
     const invoke = tauriInvoke();
     return invoke ? invoke("preview_media", { projectId }) : null;
@@ -106,28 +106,17 @@ export const desktopBridge = {
 
   async deleteJob(id: string): Promise<void> { const invoke = tauriInvoke(); if (invoke) await invoke("job_delete", { id }); },
 
-  async enqueueJob(projectId: string): Promise<PersistedJob | null> {
+  async enqueueWorkflow(projectId: string): Promise<WorkflowIntentResult | null> {
     const invoke = tauriInvoke();
     if (!invoke) return null;
-    return invoke("job_enqueue", { projectId });
+    return invoke("workflow_enqueue", { projectId });
   },
 
-  async pauseJob(id: string) { const invoke = tauriInvoke(); return invoke ? invoke<PersistedJob>("job_pause", { id }) : null; },
-  async resumeJob(id: string) { const invoke = tauriInvoke(); return invoke ? invoke<PersistedJob>("job_resume", { id }) : null; },
-  async cancelJob(id: string) { const invoke = tauriInvoke(); return invoke ? invoke<PersistedJob>("job_cancel", { id }) : null; },
-  async retryJob(id: string) { const invoke = tauriInvoke(); return invoke ? invoke<PersistedJob>("job_retry", { id }) : null; },
-
-  async runAsr(projectId: string, jobId: string): Promise<PersistedSegment[]> {
-    const invoke = tauriInvoke();
-    if (!invoke) return [];
-    return invoke("asr_run", { projectId, jobId });
-  },
-
-  async runTranslation(projectId: string, jobId: string): Promise<PersistedSegment[]> {
-    const invoke = tauriInvoke();
-    if (!invoke) return [];
-    return invoke("translation_run", { projectId, jobId });
-  },
+  async startWorkflow(jobId: string): Promise<WorkflowIntentResult | null> { const invoke = tauriInvoke(); return invoke ? invoke("workflow_start", { jobId }) : null; },
+  async continueWorkflow(jobId: string): Promise<WorkflowIntentResult | null> { const invoke = tauriInvoke(); return invoke ? invoke("workflow_continue", { jobId }) : null; },
+  async retryWorkflow(jobId: string): Promise<WorkflowIntentResult | null> { const invoke = tauriInvoke(); return invoke ? invoke("workflow_retry", { jobId }) : null; },
+  async pauseWorkflow(jobId: string) { const invoke = tauriInvoke(); return invoke ? invoke<PersistedJob>("workflow_pause", { jobId }) : null; },
+  async cancelWorkflow(jobId: string) { const invoke = tauriInvoke(); return invoke ? invoke<PersistedJob>("workflow_cancel", { jobId }) : null; },
 
   async rebuildTranslation(projectId: string, jobId: string): Promise<PersistedSegment[]> {
     const invoke = tauriInvoke();
@@ -137,16 +126,16 @@ export const desktopBridge = {
 
   async runTts(projectId: string, jobId: string, segmentIds?: string[]): Promise<TtsRunResult> {
     const invoke = tauriInvoke();
-    if (!invoke) return { warningIds: [], failedSegments: [], affectedSegmentIds: segmentIds ?? [], synthesisUnitCount: segmentIds?.length ?? 0, trackRevision: 0 };
+    if (!invoke) return { warningIds: [], failedSegments: [], affectedSegmentIds: segmentIds ?? [], synthesisUnitCount: segmentIds?.length ?? 0, cacheHitUnitCount: 0, trackRevision: 0 };
     const result = await invoke<TtsRunResult | string[]>("tts_run", { projectId, jobId, segmentIds });
     return Array.isArray(result)
-      ? { warningIds: result, failedSegments: [], affectedSegmentIds: segmentIds ?? [], synthesisUnitCount: segmentIds?.length ?? 0, trackRevision: Date.now() }
+      ? { warningIds: result, failedSegments: [], affectedSegmentIds: segmentIds ?? [], synthesisUnitCount: segmentIds?.length ?? 0, cacheHitUnitCount: 0, trackRevision: Date.now() }
       : result;
   },
 
   async runSemanticNarration(projectId: string, jobId: string): Promise<TtsRunResult> {
     const invoke = tauriInvoke();
-    if (!invoke) return { warningIds: [], failedSegments: [], affectedSegmentIds: [], synthesisUnitCount: 0, trackRevision: 0 };
+    if (!invoke) return { warningIds: [], failedSegments: [], affectedSegmentIds: [], synthesisUnitCount: 0, cacheHitUnitCount: 0, trackRevision: 0 };
     return invoke("semantic_narration_run", { projectId, jobId });
   },
 

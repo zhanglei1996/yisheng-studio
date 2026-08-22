@@ -1,7 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import { Button, Slider, Tooltip, message } from "antd";
-import { ArrowsMerge, CaretLeft, CaretRight, CursorClick, Eye, MagicWand, Magnet, Minus, Plus, Scissors } from "@phosphor-icons/react";
+import { ArrowsMerge, CaretLeft, CaretRight, Eye, MagicWand, Magnet, Minus, Plus, Scissors } from "@phosphor-icons/react";
 import { formatTimecode } from "../domain";
 import { useEditorStore } from "../store";
 import { WaveformCanvas } from "./WaveformCanvas";
@@ -9,14 +9,13 @@ import { antdIcon } from "../ui/icons";
 import { desktopBridge } from "../bridge";
 import { useQueryClient } from "@tanstack/react-query";
 
-const SelectIcon = antdIcon(CursorClick);
 const SplitIcon = antdIcon(Scissors);
 const MergeIcon = antdIcon(ArrowsMerge);
 const MagnetIcon = antdIcon(Magnet);
 
 const BASE_VIEW_DURATION = 21000;
 
-export const Timeline = memo(function Timeline() {
+export const Timeline = memo(function Timeline({ audioMode = "duck" }: { audioMode?: string }) {
   const queryClient = useQueryClient();
   const trackRef = useRef<HTMLDivElement>(null);
   const [snapping, setSnapping] = useState(true);
@@ -27,7 +26,23 @@ export const Timeline = memo(function Timeline() {
   })));
   const [analyzing, setAnalyzing] = useState(false);
   const duration = BASE_VIEW_DURATION / zoom;
-  const selected = segments.find((segment) => segment.id === selectedId);
+  const selectedIndex = segments.findIndex((segment) => segment.id === selectedId);
+  const selected = segments[selectedIndex];
+  const nextSegment = segments[selectedIndex + 1];
+  const splitDisabledReason = !selected
+    ? "请先选择一个片段"
+    : selected.locked
+      ? "请先解锁当前片段的时间边界"
+      : selected.endMs - selected.startMs < 600
+        ? "片段短于 0.6 秒，无法继续拆分"
+        : null;
+  const mergeDisabledReason = !selected
+    ? "请先选择一个片段"
+    : !nextSegment
+      ? "已经是最后一个片段"
+      : selected.locked || nextSegment.locked
+        ? "请先解锁相邻片段的时间边界"
+        : null;
   const projectEnd = segments.at(-1)?.endMs ?? duration;
   const baseViewStart = (selected?.startMs ?? segments[0]?.startMs ?? 0) - duration * 0.28;
   const viewStart = Math.min(Math.max(0, projectEnd - duration), Math.max(0, baseViewStart + panMs));
@@ -131,7 +146,11 @@ export const Timeline = memo(function Timeline() {
 
   return <section className="timeline-panel">
     <div className="timeline-toolbar">
-      <div className="tool-group"><Tooltip title="选择工具已启用"><span className="tool-status" aria-label="选择工具已启用"><SelectIcon /></span></Tooltip><Tooltip title="拆分片段"><Button className="tool-button" icon={<SplitIcon />} aria-label="拆分片段" onClick={splitSelected} /></Tooltip><Tooltip title="合并下一片段"><Button className="tool-button" icon={<MergeIcon />} aria-label="合并下一片段" onClick={mergeNext} /></Tooltip><Tooltip title="吸附"><Button className={`tool-button ${snapping ? "active-soft" : ""}`} icon={<MagnetIcon />} aria-label="吸附" aria-pressed={snapping} onClick={() => setSnapping(!snapping)} /></Tooltip></div>
+      <div className="tool-group">
+        <Tooltip title={splitDisabledReason ?? "从片段中点拆分"}><span><Button className="tool-button" icon={<SplitIcon />} aria-label="拆分片段" disabled={Boolean(splitDisabledReason)} onClick={splitSelected} /></span></Tooltip>
+        <Tooltip title={mergeDisabledReason ?? "与下一个片段合并"}><span><Button className="tool-button" icon={<MergeIcon />} aria-label="合并下一片段" disabled={Boolean(mergeDisabledReason)} onClick={mergeNext} /></span></Tooltip>
+        <Tooltip title={snapping ? "关闭片段边界吸附" : "开启片段边界吸附"}><Button className={`tool-button ${snapping ? "active-soft" : ""}`} icon={<MagnetIcon />} aria-label="片段边界吸附" aria-pressed={snapping} onClick={() => setSnapping(!snapping)} /></Tooltip>
+      </div>
       <Tooltip title="分析停顿、静止画面与同步锚点"><Button className="sync-analysis-button" size="small" icon={<MagicWand />} loading={analyzing} onClick={analyzeSync}>优化音画同步</Button></Tooltip>
       <TimelineTimecode />
       <div className="timeline-pan"><Tooltip title="向左移动时间轴"><Button type="text" size="small" icon={<CaretLeft />} aria-label="向左移动时间轴" onClick={() => panTimeline(-duration * 0.7)} /></Tooltip><span>左右滑动</span><Tooltip title="向右移动时间轴"><Button type="text" size="small" icon={<CaretRight />} aria-label="向右移动时间轴" onClick={() => panTimeline(duration * 0.7)} /></Tooltip></div>
@@ -140,7 +159,7 @@ export const Timeline = memo(function Timeline() {
     <div className="timeline-body">
       <div className="track-labels">
         <div className="ruler-label" />
-        {[{ title: "场景与画面", sub: localization ? `${localization.scenes.length} 场景 · ${localization.anchors.length} 锚点` : "等待智能同步分析" }, { title: "背景声音", sub: "原声动态避让" }, { title: "中文配音", sub: "场景级连贯旁白" }, { title: "双语字幕", sub: `${segments.length} 个片段` }].map((track) => <div className="track-label" key={track.title}><Eye /><span><strong>{track.title}</strong><small>{track.sub}</small></span></div>)}
+        {[{ title: "场景与画面", sub: localization ? `${localization.scenes.length} 场景 · ${localization.anchors.length} 锚点` : "等待智能同步分析" }, { title: "背景声音", sub: audioMode === "separate" ? "去人声背景轨 · 本地分离" : audioMode === "mute" ? "不保留原声" : "完整原声动态避让" }, { title: "中文配音", sub: "场景级连贯旁白" }, { title: "双语字幕", sub: `${segments.length} 个片段` }].map((track) => <div className="track-label" key={track.title}><Eye /><span><strong>{track.title}</strong><small>{track.sub}</small></span></div>)}
       </div>
       <div className="track-content" ref={trackRef} onWheel={(event) => {
         const delta = Math.abs(event.deltaX) > 0 ? event.deltaX : event.shiftKey ? event.deltaY : 0;

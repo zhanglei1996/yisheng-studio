@@ -109,7 +109,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   splitSelected: () => set((state) => {
     const index = state.segments.findIndex((segment) => segment.id === state.selectedId);
     const current = state.segments[index];
-    if (!current || current.endMs - current.startMs < 600) return state;
+    if (!current || current.locked || current.endMs - current.startMs < 600) return state;
     const midpoint = Math.round((current.startMs + current.endMs) / 2);
     // Without word-level alignment, automatically splitting the structured
     // document would silently move protected terms. Keep the first draft and

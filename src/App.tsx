@@ -1,6 +1,6 @@
 import { startTransition, useCallback, useEffect, useState } from "react";
 import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { Button, message } from "antd";
+import { Button, Popconfirm, message } from "antd";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Books, CheckCircle, ClockCounterClockwise, GearSix,
@@ -54,9 +54,11 @@ export function App() {
   const activeProject = appProjects.find((project) => project.id === resolvedProjectId);
   const { data: activeSegments = [] } = useQuery({ queryKey: ["segments", resolvedProjectId], queryFn: () => desktopBridge.listSegments(resolvedProjectId!), enabled: isEditor && Boolean(resolvedProjectId) && desktopBridge.isDesktop(), staleTime: 60_000 });
   const { data: readiness = null } = useQuery<ProjectReadiness | null>({ queryKey: ["readiness", resolvedProjectId], queryFn: () => desktopBridge.getProjectReadiness(resolvedProjectId!), enabled: Boolean(resolvedProjectId), refetchInterval: isEditor && desktopBridge.isDesktop() ? 3000 : false });
+  const { data: activePreflight = null } = useQuery({ queryKey: ["export-preflight", resolvedProjectId], queryFn: () => desktopBridge.getExportPreflight(resolvedProjectId!), enabled: isEditor && Boolean(resolvedProjectId) && desktopBridge.isDesktop(), staleTime: 3000 });
   const activeJobs = desktopBridge.isDesktop() ? persistedJobs.filter((job) => !["succeeded", "cancelled"].includes(job.status)).length : 2;
   const activeProjectJob = persistedJobs.find((job) => job.projectId === resolvedProjectId && job.status === "running");
-  const failedTtsSegments = activeSegments.filter((segment) => segment.ttsState === "failed" && segment.status !== "warning");
+  const blockingSegmentIds = new Set(activePreflight?.blockingSegmentIds ?? []);
+  const failedTtsSegments = activeSegments.filter((segment) => blockingSegmentIds.has(segment.id));
   const timingWarningSegments = activeSegments.filter((segment) => segment.status === "warning" && segment.ttsState !== "failed");
   const warningCount = failedTtsSegments.length + timingWarningSegments.length;
   const processedCount = activeSegments.filter((segment) => !["pending", "warning"].includes(segment.status)).length;
@@ -90,7 +92,7 @@ export function App() {
           result.previewMedia,
         );
       }
-      await Promise.all([queryClient.invalidateQueries({ queryKey: ["segments", resolvedProjectId] }), queryClient.invalidateQueries({ queryKey: ["jobs"] }), queryClient.invalidateQueries({ queryKey: ["projects"] })]);
+      await Promise.all([queryClient.invalidateQueries({ queryKey: ["segments", resolvedProjectId] }), queryClient.invalidateQueries({ queryKey: ["jobs"] }), queryClient.invalidateQueries({ queryKey: ["projects"] }), queryClient.invalidateQueries({ queryKey: ["readiness", resolvedProjectId] }), queryClient.invalidateQueries({ queryKey: ["export-preflight", resolvedProjectId] })]);
       if (result.failedSegments.length) message.error({ content: `${segmentId ? "当前语音块" : "整片"}生成失败：${result.failedSegments[0]?.message ?? "请重试"}`, key: "segment-tts" });
       else if (result.warningIds.length) message.warning({ content: `重新配音完成，仍有 ${result.warningIds.length} 个片段需要调整`, key: "segment-tts" });
       else if (segmentId && result.affectedSegmentIds.length > 1) message.success({ content: `当前语音块已重新生成，共 ${result.affectedSegmentIds.length} 条字幕`, key: "segment-tts" });
@@ -123,6 +125,7 @@ export function App() {
         queryClient.invalidateQueries({ queryKey: ["jobs"] }),
         queryClient.invalidateQueries({ queryKey: ["projects"] }),
         queryClient.invalidateQueries({ queryKey: ["readiness", resolvedProjectId] }),
+        queryClient.invalidateQueries({ queryKey: ["export-preflight", resolvedProjectId] }),
       ]);
       if (result.remainingIds.length) {
         const editor = useEditorStore.getState();
@@ -153,7 +156,6 @@ export function App() {
       message.success(`已撤销 ${restoredIds.length} 个片段的自动缩短；相关配音已标记为需要重新生成`);
     } catch (error) { message.error(String(error)); }
   }, [queryClient, resolvedProjectId]);
-
   return (
     <div className="app-shell">
       <header className="window-drag-strip" data-tauri-drag-region aria-hidden="true" />
@@ -173,10 +175,11 @@ export function App() {
 
         {isEditor && resolvedProjectId && (
           <section className="project-health">
-            <div className="section-heading"><span>项目状态</span>{warningCount > 0 && <span className="count-badge warning">{warningCount}</span>}</div>
-            {failedTtsSegments.length > 0 && <Button type="text" className="risk-row" onClick={() => locateIssue("failed")}><Warning className="danger-text" size={18} /><span><strong>在线配音失败</strong><small>{failedTtsSegments.length} 个片段 · 点击逐个定位并查看原因</small></span></Button>}
-            {timingWarningSegments.length > 0 ? <div className="risk-block"><Button type="text" className="risk-row" onClick={() => locateIssue("timing")}><Warning className="warning-text" size={18} /><span><strong>{fittingWarnings ? "正在自动修复时长" : "导出前建议处理时长"}</strong><small>{timingWarningSegments.length} 个片段 · 不阻止知情导出</small></span></Button><div className="risk-actions"><Button type="link" size="small" onClick={() => locateIssue("timing")}>逐个检查</Button><Button type="link" size="small" loading={fittingWarnings} onClick={() => fitWarnings()}>{`自动修复 ${timingWarningSegments.length} 个`}</Button></div></div> : failedTtsSegments.length === 0 && <div className="risk-row risk-clear"><CheckCircle size={18} /><span><strong>{readiness?.canExport ? "项目可导出" : "当前无阻断风险"}</strong><small>{activeSegments.length ? readiness?.nextAction ?? "识别片段均可继续处理" : "处理后将在这里显示状态"}</small></span></div>}
-            {activeSegments.length > 0 && <Button type="link" size="small" loading={rebuildingTranslation} onClick={async () => {
+            <div className="section-heading"><span>项目状态</span>{activeProject?.workflowMode !== "quick" && warningCount > 0 && <span className="count-badge warning">{warningCount}</span>}</div>
+            {activeProject?.workflowMode === "quick" && <div className="risk-row risk-clear"><CheckCircle size={18} /><span><strong>{activeProjectJob || fittingWarnings ? "正在后台自动处理" : readiness?.canExport ? "项目可直接导出" : "自动生成已接管"}</strong><small>{warningCount ? `剩余 ${warningCount} 项正在自动修复；详情可到任务队列查看` : "快速模式不会要求逐项确认"}</small></span></div>}
+            {activeProject?.workflowMode !== "quick" && failedTtsSegments.length > 0 && <Button type="text" className="risk-row" onClick={() => locateIssue("failed")}><Warning className="danger-text" size={18} /><span><strong>在线配音失败</strong><small>{failedTtsSegments.length} 个片段 · 点击逐个定位并查看原因</small></span></Button>}
+            {activeProject?.workflowMode !== "quick" && (timingWarningSegments.length > 0 ? <div className="risk-block"><Button type="text" className="risk-row" onClick={() => locateIssue("timing")}><Warning className="warning-text" size={18} /><span><strong>{fittingWarnings ? "正在自动修复时长" : "时长适配提醒"}</strong><small>{timingWarningSegments.length} 个片段 · 点击逐个检查</small></span></Button></div> : failedTtsSegments.length === 0 && <div className="risk-row risk-clear"><CheckCircle size={18} /><span><strong>{readiness?.canExport ? "项目可导出" : "当前无阻断风险"}</strong><small>{activeSegments.length ? readiness?.nextAction ?? "识别片段均可继续处理" : "处理后将在这里显示状态"}</small></span></div>)}
+            {activeSegments.length > 0 && <Popconfirm title="重新翻译全部字幕？" description="会将原文文本发送给当前翻译服务商并覆盖现有译文；不会上传原视频或原声。" okText="开始重新翻译" cancelText="取消" onConfirm={async () => {
               const job = persistedJobs.find((item) => item.projectId === resolvedProjectId);
               if (!resolvedProjectId || !job) return;
               setRebuildingTranslation(true);
@@ -186,7 +189,7 @@ export function App() {
                 message.success("字幕已按原始片段边界重新翻译");
               } catch (error) { message.error(String(error)); }
               finally { setRebuildingTranslation(false); }
-            }}>重新校准全部翻译</Button>}
+            }}><Button type="link" size="small" loading={rebuildingTranslation}>重新翻译全部字幕</Button></Popconfirm>}
             <div className="project-mini-stats">
               <span><CheckCircle size={14} /> 已处理 {processedCount}</span>
               <span><ClockCounterClockwise size={14} /> 待处理 {pendingCount}</span>
@@ -217,32 +220,22 @@ export function App() {
         try {
           const project = await desktopBridge.createProjectFromMedia(options);
           if (project) setActiveProjectId(project.id);
-          const job = project ? await desktopBridge.enqueueJob(project.id) : null;
+          const workflow = project ? await desktopBridge.enqueueWorkflow(project.id) : null;
           setCreateOpen(false);
           navigate(desktopBridge.isDesktop() ? "/queue" : "/editor");
           await Promise.all([queryClient.invalidateQueries({ queryKey: ["projects"] }), queryClient.invalidateQueries({ queryKey: ["jobs"] })]);
-          if (project && job) {
+          if (project && workflow) {
             void (async () => {
               const toastKey = `new-project-${project.id}`;
               try {
-                message.loading({ key: toastKey, content: "正在准备视频和本地识别音频…", duration: 0 });
-                await desktopBridge.prepareMedia(project.id, job.id);
-                message.loading({ key: toastKey, content: "正在本地识别英文语音…", duration: 0 });
-                await desktopBridge.runAsr(project.id, job.id);
-                message.loading({ key: toastKey, content: "正在翻译并编排中文口播稿…", duration: 0 });
-                await desktopBridge.runTranslation(project.id, job.id);
-
-                if (options.workflowMode === "quick") {
-                  const latestSegments = await desktopBridge.listSegments(project.id);
-                  const failed = latestSegments.filter((segment) => segment.ttsState === "failed");
-                  const overflow = latestSegments.filter((segment) => segment.status === "warning" && segment.ttsState !== "failed");
-                  if (!failed.length && overflow.length) {
-                    message.loading({ key: toastKey, content: `正在自动压缩 ${overflow.length} 个超时片段并完成配音…`, duration: 0 });
-                    await desktopBridge.fitTtsWarnings(project.id, job.id);
-                  }
-                  message.success({ key: toastKey, content: failed.length ? `已完成大部分配音，${failed.length} 个片段需要重试` : "中文配音已生成，可直接在编辑器预览和导出" });
+                message.loading({ key: toastKey, content: options.audioMode === "separate" ? "工作流正在本地分离人声并处理视频…" : "工作流正在处理视频、识别与中文配音…", duration: 0 });
+                const result = await desktopBridge.startWorkflow(workflow.job.id);
+                if (result?.nextAction === "open_editor") {
+                  message.info({ key: toastKey, content: result.currentNodeId === "export_publish" ? "中文配音已准备好，可以预览并导出" : "工作流已保存检查点，请打开编辑器确认后继续" });
+                } else if (result?.nextAction === "retry") {
+                  message.warning({ key: toastKey, content: "工作流已暂停并保留检查点，可在任务队列安全重试" });
                 } else {
-                  message.info({ key: toastKey, content: "口播稿已准备好，请在编辑器确认后再开始配音" });
+                  message.success({ key: toastKey, content: "工作流处理完成" });
                 }
               } catch (error) {
                 message.error({ key: toastKey, content: `生成中断：${String(error)}`, duration: 8 });

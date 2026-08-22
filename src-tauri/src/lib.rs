@@ -1,3 +1,4 @@
+mod application;
 mod asr;
 mod commands;
 mod credentials;
@@ -6,14 +7,19 @@ mod director;
 mod domain;
 mod error;
 mod exporter;
+mod infrastructure;
 mod localization;
 mod media;
+// Project-level recovery commands stay separate from the media-heavy command module.
+mod project_commands;
 mod script;
 mod timeline_map;
 mod translation;
 mod tts;
 pub mod tts_provider;
 mod visual_analysis;
+pub mod workflow;
+mod workflow_commands;
 
 use std::{
     collections::HashMap,
@@ -26,6 +32,9 @@ use tauri::Manager;
 
 pub struct AppState {
     database: Mutex<Database>,
+    workflow_store: Arc<infrastructure::workflow_store::SharedWorkflowStore>,
+    workflow_scheduler: Arc<workflow::ResourceScheduler>,
+    workflow_cancellations: Mutex<HashMap<String, workflow::CancellationToken>>,
     preview_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     tts_fit_snapshots: Mutex<HashMap<String, Vec<SegmentRecord>>>,
 }
@@ -36,10 +45,17 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
-            let database = Database::open(&data_dir.join("app.db"))
+            let database_path = data_dir.join("app.db");
+            let database = Database::open(&database_path)
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let workflow_store =
+                infrastructure::workflow_store::SharedWorkflowStore::open(&database_path)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(AppState {
                 database: Mutex::new(database),
+                workflow_store: Arc::new(workflow_store),
+                workflow_scheduler: Arc::new(workflow::ResourceScheduler::production()),
+                workflow_cancellations: Mutex::new(HashMap::new()),
                 preview_locks: Mutex::new(HashMap::new()),
                 tts_fit_snapshots: Mutex::new(HashMap::new()),
             });
@@ -52,20 +68,19 @@ pub fn run() {
             commands::project_rename,
             commands::project_delete,
             commands::project_create_from_media,
-            commands::project_readiness,
+            project_commands::project_readiness,
+            project_commands::project_audio_mode_update,
             commands::media_probe,
-            commands::media_prepare,
             commands::preview_media,
             commands::preview_prepare,
-            commands::job_enqueue,
             commands::job_list,
             commands::job_delete,
-            commands::job_start,
-            commands::job_pause,
-            commands::job_resume,
-            commands::job_cancel,
-            commands::job_retry,
-            commands::job_checkpoint,
+            workflow_commands::workflow_enqueue,
+            workflow_commands::workflow_start,
+            workflow_commands::workflow_continue,
+            workflow_commands::workflow_retry,
+            workflow_commands::workflow_pause,
+            workflow_commands::workflow_cancel,
             commands::segment_upsert,
             commands::segment_list,
             commands::segment_replace_project,
@@ -75,8 +90,6 @@ pub fn run() {
             commands::glossary_list,
             commands::glossary_save,
             commands::glossary_delete,
-            commands::asr_run,
-            commands::translation_run,
             commands::translation_rebuild,
             commands::semantic_narration_run,
             commands::tts_run,

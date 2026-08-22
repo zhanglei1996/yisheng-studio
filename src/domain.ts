@@ -55,17 +55,28 @@ export interface PreviewMedia {
 }
 
 export type JobStatus = "queued" | "running" | "waiting_user" | "paused" | "succeeded" | "failed" | "cancelled";
+export type JobStage = "media_check" | "audio_extract" | "source_separation" | "proxy" | "asr" | "glossary" | "translation" | "script_director" | "semantic_narration" | "tts" | "export";
 
 export interface PersistedJob {
   id: string;
   projectId: string;
-  stage: string;
+  stage: JobStage;
   progress: number;
   status: JobStatus;
   checkpoint?: string | null;
   errorMessage?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export type WorkflowRunState = "queued" | "running" | "waiting_for_input" | "retryable" | "succeeded" | "failed" | "cancelled";
+export type WorkflowNextAction = "none" | "continue" | "retry" | "open_editor";
+
+export interface WorkflowIntentResult {
+  job: PersistedJob;
+  workflowState: WorkflowRunState;
+  currentNodeId?: string | null;
+  nextAction: WorkflowNextAction;
 }
 
 export interface RuntimeComponent {
@@ -201,6 +212,7 @@ export interface TtsRunResult {
   failedSegments: Array<{ segmentId: string; message: string }>;
   affectedSegmentIds: string[];
   synthesisUnitCount: number;
+  cacheHitUnitCount: number;
   trackRevision: number;
   previewMedia?: PreviewMedia | null;
 }

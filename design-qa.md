@@ -1,5 +1,32 @@
 # Design QA：译声工坊暗黑编辑器
 
+## 安全模式：只替换人声（2026-08-14）
+
+- evidence: `docs/design/qa/safe-audio-mode-2026-08-14/01-create-safe-mode.jpeg`、`02-review-aliyun.jpeg`
+- tested app: 独立 macOS debug bundle，真实 RAG 测试视频，1920×1080，608.7 秒。
+- tested path: 新建项目 → 自动生成 → 安全模式 → DeepSeek 翻译 → 阿里百炼 TTS / Cherry → 确认摘要；已有“测试2”项目升级为安全模式后执行导出预检。
+
+### 视觉与交互结果
+
+- “安全模式 · 只替换人声”成为原声处理的默认推荐项，首屏解释保留音乐、点击和环境声，同时明确“不恢复完整原声”。
+- 信息提示明确首次需要本地模型；组件、模型或分离结果失败时会停止任务并阻止导出，避免把 ducking 冒充人声分离。
+- `duck` 继续可选，但文案明确存在英文残留风险；`mute` 明确只保留中文配音。
+- 服务配置的数据范围说明“原视频、识别音频和人声分离留在本地”；阿里百炼只接收确认后的中文口播稿。
+- 最终确认页显示 `安全模式 · 只替换人声`、`阿里百炼 TTS · Cherry`，用户在开始处理前能复核关键选择。
+- 编辑器时间轴按项目模式标注背景轨；安全模式显示“去人声背景轨 · 本地分离”，不再使用容易误解的“原声动态避让”。
+- 对照暗黑编辑器视觉真相，弹窗继续使用既有紧凑间距、Ant Design 控件、蓝色主操作和 Phosphor 信息图标；1229×768 窗口无截断或横向溢出。
+
+### 媒体与门禁结果
+
+- 8 秒真实片段完成本地分离；完整 608.69 秒视频在 Apple Silicon 上约 4 分 55 秒完成，背景轨输出为 48kHz 立体声 WAV。
+- 30–40 秒纯讲话区间中，背景轨平均电平由源音频 `-15.2 dB` 降至 `-55.3 dB`，原语言主声约降低 40 dB。
+- 598–606 秒非语言尾段中，背景轨平均电平为 `-39.7 dB`，源音频为 `-36.7 dB`，说明事件能量仍被保留而不是整轨静音。
+- 安全模式导出预检只显示既有字幕阅读速度提醒，没有 `safe_background_not_ready` 阻断；删除/过期背景轨时后端会阻止导出。
+- 回归发现中文轨同时驱动 sidechain 与最终混音但未显式分流，长片输出会丢失中文并放大背景中的英文残留；现已使用 `asplit=2` 分成控制轨与可听轨，并用混音配方版本淘汰旧缓存。
+- 修复后 608.7 秒成片为 H.264 + AAC、48kHz 立体声；前 35 秒与英文源音频相关系数由约 `0.999` 降至 `-0.0014`，英文 ASR 不再输出原稿，只报告非英语语音。
+
+final result: passed — 默认路径、风险文案、本地数据边界、失败阻断及真实媒体分离均符合安全模式定义。
+
 ## 可发布配音：场景、音画编辑与发布门禁（2026-08-14）
 
 - visual truth: `docs/design/references/editor-dark-reference.png`
@@ -32,6 +59,85 @@ final result: passed — 未发现 P0/P1/P2 视觉问题；保持既有暗色设
 - 异常状态：原视频缺失或解码失败时显示“正在生成视频首帧”的中性空态，不再回退为与项目无关的固定图片。
 - 可访问性：真实封面的替代文本为“项目名 + 视频首帧”；空态使用既有 Phosphor `FileVideo` 图标和文字共同表意。
 - 验证：真实 HSTS 源视频已生成 15,616-byte 首帧 JPEG，内容为视频开头的 `Practical Networking` 标题，与固定 `RAG Pipeline` 图明显不同；Rust 回归测试同时覆盖生成与缓存复用。
+
+final result: passed
+
+# 阿里 TTS 小白英文转中文全链路回归（2026-08-15）
+
+- 视觉基准：`docs/design/references/editor-dark-reference.png`；并排证据为 `docs/design/audits/2026-08-14-aliyun-tts-novice-flow/37-reference-vs-export-progress.png`。修复后继续保留专业暗色编辑器、紧凑密度、四轨时间轴和蓝/绿/琥珀/红语义色。
+- 真实路径：英文视频导入 → 识别/翻译 → 阿里百炼 TTS → 人声分离失败后原项目一键改用静音原声 → 只补缺失语音块 → 确认 6 条非阻断阅读速度提醒 → 导出。
+- 状态与费用：TTS 逐块保存，暂停、重启与重试不会清空已完成缓存；界面显示完成/总数及复用数量。本次最终回归未再次全量调用阿里服务。
+- 小白恢复：技术错误从主界面收敛为原因、影响和明确动作；导出问题以片段序号和时间呈现；等待、暂停、继续、正在导出和完成状态的按钮文案与实际动作一致。
+- 最终验证：App 显示导出完成，Finder 可定位输出包；`36-final-quicktime-playing.jpeg` 记录 QuickTime 实际播放到 3 秒，画面可见中文烧录字幕。
+- 产物验证：608.700 秒 H.264 1280×720/60 fps MP4，仅一条 48 kHz 立体声 AAC；中文、英文、配音同步 SRT 各 162 条。
+- 已知边界：跨重启时稳定导出依赖本地持久预览代理，因此界面如实标注“本地预览画质（最高 720p）”，没有宣称 1080p。声学自然度仍需人工完整盲听；本轮只确认播放器真实运行、音轨存在与字幕可见。
+- 完整审计：`docs/design/audits/2026-08-14-aliyun-tts-novice-flow/AUDIT.md`。
+
+final result: passed — real Alibaba TTS novice flow completed through exported Chinese-dubbed video playback.
+
+## 快速模式自动处理与音轨缓存切换（2026-08-14）
+
+- 视觉基准：继续沿用 `docs/design/references/editor-dark-reference.png`；编辑器三栏结构、四轨时间轴和蓝/绿/琥珀/红语义色未改变。
+- 快速模式：编辑器顶部不再出现需要人工点击的时长/失败横幅，项目状态收敛为“后台自动生成中 / 后台自动修复中 / 自动处理完成”，导出按钮不再附带问题计数制造人工确认预期。
+- 侧栏：快速项目只显示自动处理状态，不提供“逐个定位/逐个检查”入口；无法自动恢复的最终结果仍保留在任务队列，不隐藏真实失败。
+- 音轨切换：任务队列的配音摘要同时展示服务商、模型、音色、连续性模式和 `缓存复用 x/y`；完整命中时明确显示“未重复合成”。
+- 云端范围：切换到未缓存配置时，仍只向已选择的 TTS 服务发送中文口播文本和合成参数；本地缓存命中不会再次请求服务商，原视频与原声不上传。
+- Browser 交互检查：快速项目编辑器确认大横幅已移除，顶部为“自动处理完成 + 导出”；任务队列确认 `macOS 系统语音 · Tingting · 严格同步 · 缓存音轨 4/4 · 未重复合成` 可见。
+- 运行质量：本地页面控制台错误为 0；布局和时间轴密度相对视觉基准无回归。
+
+final result: passed
+
+# 编辑器整体交互审查与收敛（2026-08-14）
+
+- source visual truth: `docs/design/qa/editor-professional-audit-2026-08-14/01-reference-current-editor.png`
+- implementation screenshot: `docs/design/qa/editor-professional-audit-2026-08-14/06-editor-final.png`
+- compact implementation: `docs/design/qa/editor-professional-audit-2026-08-14/05-editor-1280x800-fixed.png`
+- combined comparison: `docs/design/qa/editor-professional-audit-2026-08-14/07-reference-vs-final.png`
+- viewport and density: source 2880 × 1800，按相同比例归一化为 1996 × 1246；implementation CSS viewport 1996 × 1246、device pixel ratio 1，截图 1996 × 1246。紧凑窗口为 1280 × 800、device pixel ratio 1。
+- state: source 为真实项目的“1 个配音失败 + 2 个时长提醒”混合问题态；implementation 为 Browser 回退数据的“1 个时长提醒”态。比较聚焦稳定的信息架构、工具栏、检查器和状态层级，不对动态媒体内容做像素一致性判断。
+
+## Full-view comparison evidence
+
+- [passed] 延续 `docs/design/references/editor-dark-reference.png` 的专业暗色三栏编辑器、四轨时间线，以及蓝/绿/琥珀/红语义色；没有引入新的卡片风格或图标体系。
+- [passed] 顶部动作栏、问题横幅、预览、时间线和检查器仍保持原区域比例；新增 35px 片段上下文栏没有造成检查器裁切。
+- [passed] 删除无行为的蓝色选择工具后，时间线工具组只保留拆分、合并、吸附和智能同步等真实动作。
+- [passed] 1280 × 800 下文档无横向或纵向溢出，Inspector 保持 480px；时间线工具栏 clientWidth/scrollWidth 均为 598px。
+
+## Focused region comparison evidence
+
+- 异常恢复：混合问题态文案同时展示配音失败与时长提醒；阻断失败为主动作，批量时长修复降为次级，左侧状态卡不再重复批量修复。
+- 检查器：新增 `片段 N / 总数`、就绪/提醒/失败/待重生成状态和前后导航；文本、声音、对齐三标签均在 Browser 中切换成功。
+- 时间线：选择状态占位已删除；锁定时间边界后拆分和合并均为 disabled，解锁后恢复；吸附的 `aria-pressed` 从 `true` 切换到 `false` 并可恢复。
+- 导出：提醒态点击“导出”打开具名 `导出视频` dialog，展示返回自动修复与知情导出；关闭后弹窗消失。
+- 高影响动作：重新翻译全部字幕增加覆盖确认，并明确只向翻译服务商发送原文文本、不上传原视频或原声。
+
+## Required fidelity surfaces
+
+- Fonts and typography: 继续使用系统字体、PingFang SC 和 SF Mono 时间码；新增上下文栏采用 11/10/9px 层级，与既有紧凑编辑器密度一致，无异常换行。
+- Spacing and layout rhythm: 维持 202px 侧栏和既有 Inspector 宽度；新增 35px 上下文栏使用同一边框节奏。1280px 下隐藏“左右滑动 / 缩放”文字并收紧滑杆，工具栏保持 48px 单行。
+- Colors and tokens: 新增状态标签复用既有 blue/green/amber/red token 语义；阻断红、提醒琥珀、待生成蓝、就绪绿均有文字标签。
+- Image quality and assets: 本轮没有新增或替换位图资产；所有新图标使用 Phosphor Icons，没有文本字形、手写 SVG 或 CSS 图标替代。
+- Copy and content: “自动修复 2 个片段”与“1 个片段失败”的混合信息改为两类问题并列；“为什么会出现”改为与当前异常匹配的“处理说明”；阻断态导出改为“导出检查”。
+
+## Interaction, accessibility, and console evidence
+
+- 片段导航从 2/4 前进到 3/4，状态从“时长提醒”更新为“已就绪”。
+- 锁定时间边界后拆分/合并均不可用；状态层 `splitSelected` 同样拒绝锁定片段，避免绕过界面。
+- 对齐页可由“逐个检查”直接打开；声音页完整显示试听、连续性、导演与数据范围说明。
+- 主要控件有可访问名称；阻断横幅使用 `alert`，非阻断横幅使用 `status`，锁定与吸附使用 `aria-pressed`。
+- Browser console error log为空。
+
+## Comparison history
+
+- Earlier P1：混合异常时标题强调配音失败，主按钮却自动修复时长，左侧再次出现同一批量动作。Fix：按阻断等级重排标题、说明和动作，左侧只保留逐个定位。Post-fix evidence：`06-editor-final.png`。
+- Earlier P1：静态选择状态使用蓝色激活按钮外观但没有行为；拆分/合并不呈现无效原因。Fix：移除占位，补齐禁用条件、Tooltip 和状态层锁定保护。Post-fix evidence：Browser DOM 与 `06-editor-final.png`。
+- Earlier P2：检查器缺少当前片段位置和连续导航。Fix：增加上下文栏、状态与前后按钮。Post-fix evidence：`06-editor-final.png`。
+- Earlier P2：1280px 下“左右滑动 / 缩放”被挤成竖排。Fix：窄窗口隐藏文字标签、收紧滑杆和间距。Post-fix evidence：`04-editor-1280x800.png` → `05-editor-1280x800-fixed.png`。
+
+## Findings
+
+- 无剩余 P0/P1/P2。
+- P3：Browser 回退项目只有 4 个片段，无法等价验证真实 162 片段项目的所有文字截断；现有时间线已采用 `overflow: hidden` 和省略策略，仍建议在真实桌面数据中做一次人工快速扫视。
 
 final result: passed
 
@@ -331,7 +437,7 @@ final result: passed
 
 ## 方案三：口播稿内联编排与双云 TTS（2026-08-13）
 
-- selected design reference: `/Users/mac/.codex/generated_images/019ff649-aa95-74b0-82ed-ecab11a60b90/exec-25950c6a-9257-45fc-8d86-e106c6fea292.png`
+- selected design reference: `docs/design/references/editor-dark-reference.png`
 - combined visual comparison: `docs/design/qa/tts-voice-reference-comparison.png`
 - editor captures: `docs/design/qa/tts-voice-editor-1440x900.png`, `docs/design/qa/tts-voice-editor-1280x720.png`
 - credential form captures: `docs/design/qa/provider-aliyun-form-1440x900.png`, `docs/design/qa/provider-iflytek-form-1440x900.png`

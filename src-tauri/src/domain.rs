@@ -155,6 +155,7 @@ pub struct TtsRunResult {
     pub failed_segments: Vec<TtsSegmentFailure>,
     pub affected_segment_ids: Vec<String>,
     pub synthesis_unit_count: usize,
+    pub cache_hit_unit_count: usize,
     pub track_revision: u64,
     pub preview_media: Option<PreviewMedia>,
 }
@@ -315,6 +316,67 @@ pub enum RuntimeStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStage {
+    MediaCheck,
+    AudioExtract,
+    SourceSeparation,
+    Proxy,
+    Asr,
+    Glossary,
+    Translation,
+    ScriptDirector,
+    SemanticNarration,
+    Tts,
+    Export,
+}
+
+impl JobStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MediaCheck => "media_check",
+            Self::AudioExtract => "audio_extract",
+            Self::SourceSeparation => "source_separation",
+            Self::Proxy => "proxy",
+            Self::Asr => "asr",
+            Self::Glossary => "glossary",
+            Self::Translation => "translation",
+            Self::ScriptDirector => "script_director",
+            Self::SemanticNarration => "semantic_narration",
+            Self::Tts => "tts",
+            Self::Export => "export",
+        }
+    }
+}
+
+impl std::fmt::Display for JobStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<&str> for JobStage {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "media_check" => Ok(Self::MediaCheck),
+            "audio_extract" => Ok(Self::AudioExtract),
+            "source_separation" => Ok(Self::SourceSeparation),
+            "proxy" => Ok(Self::Proxy),
+            "asr" => Ok(Self::Asr),
+            "glossary" => Ok(Self::Glossary),
+            "translation" => Ok(Self::Translation),
+            "script_director" => Ok(Self::ScriptDirector),
+            "semantic_narration" => Ok(Self::SemanticNarration),
+            "tts" => Ok(Self::Tts),
+            "export" => Ok(Self::Export),
+            _ => Err(format!("未知任务阶段：{value}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
@@ -332,7 +394,7 @@ pub enum JobStatus {
 pub struct JobSummary {
     pub id: String,
     pub project_id: String,
-    pub stage: String,
+    pub stage: JobStage,
     pub progress: u8,
     pub status: JobStatus,
     pub checkpoint: Option<String>,

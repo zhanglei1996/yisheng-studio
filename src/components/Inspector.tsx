@@ -1,6 +1,6 @@
 import { memo } from "react";
 import { useShallow } from "zustand/shallow";
-import { ArrowCounterClockwise, ClockCounterClockwise, Copy, Link, LinkBreak, LockSimple, MagicWand } from "@phosphor-icons/react";
+import { ArrowCounterClockwise, CaretLeft, CaretRight, ClockCounterClockwise, Copy, Link, LinkBreak, LockSimple, LockSimpleOpen, MagicWand } from "@phosphor-icons/react";
 import { Button, Input, Segmented, Tooltip } from "antd";
 import { formatTimecode, type TtsVoice } from "../domain";
 import { useEditorStore } from "../store";
@@ -8,6 +8,9 @@ import { antdIcon } from "../ui/icons";
 import { VoiceInspector, type VoiceSynthesisEstimate } from "./voice/VoiceInspector";
 
 const LockIcon = antdIcon(LockSimple);
+const UnlockIcon = antdIcon(LockSimpleOpen);
+const PreviousIcon = antdIcon(CaretLeft);
+const NextIcon = antdIcon(CaretRight);
 const CopyIcon = antdIcon(Copy);
 const LinkIcon = antdIcon(Link);
 const UnlinkIcon = antdIcon(LinkBreak);
@@ -30,11 +33,19 @@ export interface InspectorProps {
 }
 
 export const Inspector = memo(function Inspector({ onRegenerate, onSmartFit, regenerating, onPreviewVoice, onRunDirector, onProjectVoiceChange, voices, voiceEstimate, syncMode = "strict", syncBlockSize = 1, syncBlockDurationMs, onSyncModeChange }: InspectorProps) {
-  const { segments, selectedId, inspectorTab, setInspectorTab, updateSegment } = useEditorStore(useShallow((state) => ({
-    segments: state.segments, selectedId: state.selectedId, inspectorTab: state.inspectorTab, setInspectorTab: state.setInspectorTab, updateSegment: state.updateSegment,
+  const { segments, selectedId, inspectorTab, selectSegment, setInspectorTab, updateSegment } = useEditorStore(useShallow((state) => ({
+    segments: state.segments, selectedId: state.selectedId, inspectorTab: state.inspectorTab, selectSegment: state.selectSegment, setInspectorTab: state.setInspectorTab, updateSegment: state.updateSegment,
   })));
   const segment = segments.find((item) => item.id === selectedId) ?? segments[0];
   if (!segment) return null;
+  const selectedIndex = Math.max(0, segments.findIndex((item) => item.id === segment.id));
+  const segmentState = segment.ttsState === "failed"
+    ? { label: "配音失败", tone: "danger" }
+    : segment.status === "warning"
+      ? { label: "时长提醒", tone: "warning" }
+      : segment.status === "stale"
+        ? { label: "等待重新生成", tone: "pending" }
+        : { label: "已就绪", tone: "success" };
   const durationPending = segment.status === "warning" && !segment.ttsDurationMs;
   const regenerate = () => onRegenerate(segment.id);
   const copySource = async () => {
@@ -58,9 +69,16 @@ export const Inspector = memo(function Inspector({ onRegenerate, onSmartFit, reg
   });
   return <aside className="inspector">
     <div className="inspector-tabs"><Segmented block options={[{ label: "文本", value: "text" }, { label: "声音", value: "voice" }, { label: "对齐", value: "align" }]} value={inspectorTab} onChange={(value) => setInspectorTab(value as "text" | "voice" | "align")} /></div>
+    <div className="inspector-contextbar">
+      <div><strong>片段 {selectedIndex + 1}</strong><span>/ {segments.length}</span><em className={`segment-state ${segmentState.tone}`}>{segmentState.label}</em></div>
+      <div className="segment-navigator">
+        <Tooltip title="上一片段（↑）"><Button type="text" size="small" icon={<PreviousIcon />} aria-label="上一片段" disabled={selectedIndex === 0} onClick={() => selectSegment(segments[selectedIndex - 1].id)} /></Tooltip>
+        <Tooltip title="下一片段（↓）"><Button type="text" size="small" icon={<NextIcon />} aria-label="下一片段" disabled={selectedIndex >= segments.length - 1} onClick={() => selectSegment(segments[selectedIndex + 1].id)} /></Tooltip>
+      </div>
+    </div>
     {inspectorTab !== "voice" && <div className="inspector-content">
       {inspectorTab === "text" && <>
-        <div className="inspector-title"><div><span>片段文本</span><small>{formatTimecode(segment.startMs)} – {formatTimecode(segment.endMs)}</small></div><Tooltip title={segment.locked ? "解锁片段" : "锁定片段"}><Button type="text" icon={<LockIcon />} aria-label={segment.locked ? "解锁片段" : "锁定片段"} onClick={() => updateSegment(segment.id, { locked: !segment.locked })} /></Tooltip></div>
+        <div className="inspector-title"><div><span>片段文本</span><small>{formatTimecode(segment.startMs)} – {formatTimecode(segment.endMs)}</small></div><Tooltip title={segment.locked ? "解锁时间边界" : "锁定时间边界"}><Button type="text" icon={segment.locked ? <LockIcon /> : <UnlockIcon />} aria-label={segment.locked ? "解锁时间边界" : "锁定时间边界"} aria-pressed={segment.locked} onClick={() => updateSegment(segment.id, { locked: !segment.locked })} /></Tooltip></div>
         <label className="text-block"><span>源语言（英语）<Tooltip title="复制原文"><Button type="text" size="small" icon={<CopyIcon />} aria-label="复制原文" onClick={() => void copySource()} /></Tooltip></span><Input.TextArea autoSize={{ minRows: 2, maxRows: 5 }} value={segment.sourceText} onChange={(event) => updateSegment(segment.id, { sourceText: event.target.value })} /></label>
         <label className="text-block"><span>字幕译文（中文）<em>{segment.linked ? "与配音联动" : "独立字幕"}</em></span><Input.TextArea showCount maxLength={500} autoSize={{ minRows: 2, maxRows: 5 }} value={segment.subtitleZh} onChange={(event) => updateSegment(segment.id, { subtitleZh: event.target.value, spokenZh: segment.linked ? event.target.value : segment.spokenZh })} /></label>
         <div className="field-heading"><span>配音文案</span><Button type="link" size="small" icon={segment.linked ? <LinkIcon /> : <UnlinkIcon />} onClick={() => updateSegment(segment.id, { linked: !segment.linked, spokenZh: !segment.linked ? segment.subtitleZh : segment.spokenZh })}>{segment.linked ? "已联动" : "独立文案"}</Button></div>

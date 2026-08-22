@@ -166,6 +166,7 @@ export const EditorPage = memo(function EditorPage({ active, onCreate, onExport,
   const { data: projectSegments = [] } = useQuery({ queryKey: ["segments", projectId], queryFn: () => desktopBridge.listSegments(projectId!), enabled: active && Boolean(projectId) && desktopBridge.isDesktop(), staleTime: 60_000 });
   const { data: localizationAnalysis } = useQuery({ queryKey: ["localization-analysis", projectId], queryFn: () => desktopBridge.analyzeLocalization(projectId!), enabled: active && Boolean(projectId) && desktopBridge.isDesktop(), staleTime: 60_000 });
   const { data: projects = [] } = useQuery({ queryKey: ["projects"], queryFn: desktopBridge.listProjects });
+  const { data: jobs = [] } = useQuery({ queryKey: ["jobs"], queryFn: desktopBridge.listJobs, enabled: active && desktopBridge.isDesktop(), staleTime: 3_000 });
   const project = projects.find((item) => item.id === projectId);
   const { data: providers = [] } = useQuery({ queryKey: ["providers"], queryFn: desktopBridge.listProviders, enabled: active && desktopBridge.isDesktop(), staleTime: 60_000 });
   const ttsProviderId = project?.ttsProviderId ?? "system";
@@ -360,6 +361,36 @@ export const EditorPage = memo(function EditorPage({ active, onCreate, onExport,
     const audio = new Audio(desktopBridge.isDesktop() ? convertFileSrc(preview.path) : preview.path);
     await audio.play();
   }, [persistEditorSnapshot, projectId, projectSegments, ttsProviderId, voices]);
+  const activateProjectTrack = useCallback(async (syncMode: "strict" | "balanced" | "narration" | "semantic", label: string) => {
+    if (!projectId) return;
+    const job = jobs.find((item) => item.projectId === projectId);
+    if (!job) throw new Error("项目缺少可恢复的任务记录，无法切换配音音轨");
+    message.loading({ key: "activate-tts-track", content: `正在切换到${label}并检查本地音轨缓存…`, duration: 0 });
+    const result = syncMode === "semantic"
+      ? await desktopBridge.runSemanticNarration(projectId, job.id)
+      : await desktopBridge.runTts(projectId, job.id);
+    let remainingWarnings = result.warningIds.length;
+    if (!result.failedSegments.length && result.warningIds.length) {
+      const fitted = await desktopBridge.fitTtsWarnings(projectId, job.id, result.warningIds);
+      remainingWarnings = fitted.remainingIds.length;
+    }
+    if (result.previewMedia) queryClient.setQueriesData({ queryKey: ["preview-media", projectId] }, result.previewMedia);
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["projects"] }),
+      queryClient.invalidateQueries({ queryKey: ["segments", projectId] }),
+      queryClient.invalidateQueries({ queryKey: ["readiness", projectId] }),
+      queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+      queryClient.invalidateQueries({ queryKey: ["preview-media", projectId] }),
+    ]);
+    const generated = Math.max(0, result.synthesisUnitCount - result.cacheHitUnitCount);
+    if (result.failedSegments.length || remainingWarnings) {
+      message.warning({ key: "activate-tts-track", content: `${label}已切换；后台已尽量自动修复，剩余 ${result.failedSegments.length + remainingWarnings} 项可在任务队列查看` });
+    } else if (generated === 0 && result.synthesisUnitCount > 0) {
+      message.success({ key: "activate-tts-track", content: `已直接切换到缓存音轨：${label}，未重复请求语音服务` });
+    } else {
+      message.success({ key: "activate-tts-track", content: `已切换到${label}；复用 ${result.cacheHitUnitCount} 个缓存单元，仅补生成 ${generated} 个` });
+    }
+  }, [jobs, projectId, queryClient]);
   const changeProjectVoice = useCallback(async (voice: TtsVoice) => {
     if (!projectId) return;
     if (!desktopBridge.isDesktop()) { setProjectVoice(voice.id); return; }
@@ -373,17 +404,11 @@ export const EditorPage = memo(function EditorPage({ active, onCreate, onExport,
         directorEnabled: project?.ttsDirectorEnabled ?? true,
         syncMode: project?.ttsSyncMode ?? "strict",
       });
-      setProjectVoice(voice.id);
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["projects"] }),
-        queryClient.invalidateQueries({ queryKey: ["segments", projectId] }),
-        queryClient.invalidateQueries({ queryKey: ["readiness", projectId] }),
-      ]);
-      message.success(`项目默认声音已更新为 ${voice.name}；之后的整片生成和待更新片段都会使用它`);
+      await activateProjectTrack(project?.ttsSyncMode ?? "strict", voice.name);
     } catch (error) {
       message.error(`切换项目音色失败：${String(error)}`);
     }
-  }, [project?.ttsDirectorEnabled, project?.ttsSettingsJson, project?.ttsStyle, project?.ttsSyncMode, project?.ttsVoiceId, projectId, queryClient, setProjectVoice]);
+  }, [activateProjectTrack, project?.ttsDirectorEnabled, project?.ttsSettingsJson, project?.ttsStyle, project?.ttsSyncMode, projectId]);
   const changeSyncMode = useCallback(async (syncMode: "strict" | "balanced" | "narration" | "semantic") => {
     if (!projectId || !project || syncMode === (project.ttsSyncMode ?? "strict")) return;
     try {
@@ -396,16 +421,12 @@ export const EditorPage = memo(function EditorPage({ active, onCreate, onExport,
         directorEnabled: project.ttsDirectorEnabled ?? true,
         syncMode,
       });
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["projects"] }),
-        queryClient.invalidateQueries({ queryKey: ["segments", projectId] }),
-        queryClient.invalidateQueries({ queryKey: ["readiness", projectId] }),
-      ]);
-      message.success(syncMode === "semantic" ? "已切换语义旁白；整片生成时将先按场景改写，再以 5–15 秒语义节拍重新对齐" : syncMode === "narration" ? "已切换旧版连续旁白" : syncMode === "balanced" ? "已切换平衡模式；现有配音已标记待更新，请重新生成整片" : "已切换严格同步；现有配音已标记待更新，请重新生成整片");
+      const label = syncMode === "semantic" ? "语义旁白" : syncMode === "narration" ? "连续旁白" : syncMode === "balanced" ? "平衡连续模式" : "严格同步模式";
+      await activateProjectTrack(syncMode, label);
     } catch (error) {
       message.error(`切换配音连续性失败：${String(error)}`);
     }
-  }, [project, projectId, queryClient]);
+  }, [activateProjectTrack, project, projectId]);
   const runDirector = useCallback(async (segmentId: string) => {
     const segment = useEditorStore.getState().segments.find((item) => item.id === segmentId);
     if (!segment) return;
@@ -431,6 +452,9 @@ export const EditorPage = memo(function EditorPage({ active, onCreate, onExport,
   const needsInitialFullTts = segments.length > 0
     && blockingFailures.length === segments.length
     && segments.every((segment) => ["missing", "stale"].includes(segment.ttsState ?? "") && (!segment.ttsDurationMs || project?.ttsSyncMode !== "strict"));
+  const issueHelp = blockingFailures.length
+    ? "配音失败通常来自服务商连接、额度或声音配置。先定位失败片段查看具体原因；时长提醒可在失败片段恢复后批量修复。"
+    : "中文口播通常比原语音更长。系统会优先精简口播稿；常规加速最高 1.08x，极短片段可在 1.25x 内兜底适配。";
   const selectIssue = useCallback((kind: "timing" | "failed") => {
     const issues = kind === "timing" ? timingWarnings : blockingFailures;
     if (!issues.length) return;
@@ -492,7 +516,7 @@ export const EditorPage = memo(function EditorPage({ active, onCreate, onExport,
       <div className="project-context"><strong>{project?.name ?? "Building Reliable AI Agents"}</strong><span>{project?.workflowMode === "review" ? "先校对模式" : "快速生成模式"}</span></div>
       <div className="undo-group"><Button type="text" disabled={!history.length} icon={<UndoIcon />} onClick={undo}>撤销</Button><Button type="text" disabled={!future.length} icon={<RedoIcon />} onClick={redo}>重做</Button></div>
       <div className="editor-spacer" />
-      <span className={`project-state ${readiness?.phase ?? "processing"}`}><i />{readiness?.nextAction ?? "本地处理"}</span>
+      <span className={`project-state ${readiness?.phase ?? "processing"}`} role="status"><i />{project?.workflowMode === "quick" ? activeJob ? "后台自动生成中" : readiness?.canExport ? "自动处理完成" : "后台自动修复中" : readiness?.nextAction ?? "本地处理"}</span>
       <Popconfirm
         title="重新生成整片中文配音？"
         description={`将按当前声音和口播稿重新生成 ${segments.length} 个片段，在线服务可能产生费用。`}
@@ -502,23 +526,24 @@ export const EditorPage = memo(function EditorPage({ active, onCreate, onExport,
       >
         <Button size="small" icon={<Waveform size={15} />}>整片重新配音</Button>
       </Popconfirm>
-      <Button type="primary" size="small" icon={<ExportIcon />} onClick={onExport}>{readiness?.blockingCount ? `导出 · ${readiness.blockingCount} 个问题` : readiness?.warningCount ? `导出 · ${readiness.warningCount} 条提醒` : "导出"}</Button>
+      <Tooltip title={project?.workflowMode === "quick" ? "系统会先完成后台自动修复，再进入导出" : readiness?.blockingCount ? "当前无法直接导出，点击查看需要处理的问题" : "检查发布质量并选择导出格式"}><Button type="primary" size="small" icon={<ExportIcon />} onClick={onExport}>{project?.workflowMode === "quick" ? "导出" : readiness?.blockingCount ? `导出检查 · ${readiness.blockingCount} 个问题` : readiness?.warningCount ? `导出 · ${readiness.warningCount} 条提醒` : "导出"}</Button></Tooltip>
     </div>
-    {(timingWarnings.length > 0 || blockingFailures.length > 0 || fitResult) && <section className={`duration-task-banner ${blockingFailures.length ? "blocking" : "warning"}`} aria-live="polite">
+    {project?.workflowMode !== "quick" && (timingWarnings.length > 0 || blockingFailures.length > 0 || fitResult) && <section className={`duration-task-banner ${blockingFailures.length ? "blocking" : "warning"}`} aria-live="polite" role={blockingFailures.length ? "alert" : "status"}>
       <div className="duration-task-icon">{blockingFailures.length ? <Warning weight="fill" /> : <Info weight="fill" />}</div>
       <div className="duration-task-copy">
-        <strong>{needsInitialFullTts ? project?.ttsSyncMode === "semantic" ? "语义旁白需要重新理解并生成整片" : project?.ttsSyncMode === "narration" ? "连续旁白需要生成一次章节音轨" : project?.ttsSyncMode === "balanced" ? "平衡模式需要生成一次连续语音块" : "尚未完成首次全片配音" : blockingFailures.length ? `${blockingFailures.length} 个片段尚未成功生成配音` : timingWarnings.length ? `${timingWarnings.length} 个片段的配音超过原视频时间窗` : "自动修复已完成"}</strong>
-        <span>{needsInitialFullTts ? project?.ttsSyncMode === "semantic" ? "阿里百炼先按 30–60 秒场景理解原意并重写口播，再由项目当前语音服务落到 5–15 秒画面锚点连续合成；允许语义改写，但不会长期偏离画面。" : project?.ttsSyncMode === "narration" ? "将按约 60–100 秒自然章节连接阿里百炼 Realtime。" : project?.ttsSyncMode === "balanced" ? "将把相邻字幕组合为 5–15 秒语音块并使用项目当前语音服务连续合成，减少每句重新起范；字幕时间码不会改变。" : "当前还没有可复用的片段音频。请先生成整片配音，完成后才可以单独重试片段。" : blockingFailures.length ? "这些问题会阻止导出。建议先逐个重试失败片段。" : timingWarnings.length ? "可能出现语音重叠。推荐先自动缩短口播稿并重新校验，字幕译文不会改变。" : "所有时长问题均已解决，项目现在可以安全导出。"}</span>
+        <strong>{needsInitialFullTts ? project?.ttsSyncMode === "semantic" ? "语义旁白需要重新理解并生成整片" : project?.ttsSyncMode === "narration" ? "连续旁白需要生成一次章节音轨" : project?.ttsSyncMode === "balanced" ? "平衡模式需要生成一次连续语音块" : "尚未完成首次全片配音" : blockingFailures.length && timingWarnings.length ? `${blockingFailures.length} 个配音失败，${timingWarnings.length} 个时长提醒` : blockingFailures.length ? `${blockingFailures.length} 个片段尚未成功生成配音` : timingWarnings.length ? `${timingWarnings.length} 个片段的配音超过原视频时间窗` : "自动修复已完成"}</strong>
+        <span>{needsInitialFullTts ? project?.ttsSyncMode === "semantic" ? "阿里百炼先按 30–60 秒场景理解原意并重写口播，再由项目当前语音服务落到 5–15 秒画面锚点连续合成；允许语义改写，但不会长期偏离画面。" : project?.ttsSyncMode === "narration" ? "将按约 60–100 秒自然章节连接阿里百炼 Realtime。" : project?.ttsSyncMode === "balanced" ? "将把相邻字幕组合为 5–15 秒语音块并使用项目当前语音服务连续合成，减少每句重新起范；字幕时间码不会改变。" : "当前还没有可复用的片段音频。请先生成整片配音，完成后才可以单独重试片段。" : blockingFailures.length ? `配音失败会阻止导出，请先逐个处理${timingWarnings.length ? "；时长提醒可随后批量修复" : ""}。` : timingWarnings.length ? "可能出现语音重叠。推荐先自动缩短口播稿并重新校验，字幕译文不会改变。" : "所有时长问题均已解决，项目现在可以安全导出。"}</span>
         {ttsProgressMatch && <div className="fit-progress"><i style={{ width: `${activeJob?.progress ?? 0}%` }} /><em>{activeJob?.stage === "semantic_narration" ? `正在改写语义场景 ${ttsProgressMatch[3]}/${ttsProgressMatch[4]}` : ttsProgressMatch[1] === "chapter" ? Number(ttsProgressMatch[3]) === 0 ? "正在连接阿里百炼并发送第 1 章正文" : `已完成 ${ttsProgressMatch[3]} / ${ttsProgressMatch[4]} 个连续旁白章节` : ttsProgressMatch[1] === "scene" ? `正在合成语义场景 ${ttsProgressMatch[3]}/${ttsProgressMatch[4]}` : `正在合成语音块 ${ttsProgressMatch[3]}/${ttsProgressMatch[4]}`} · {activeJob?.progress ?? 0}%</em></div>}
         {fittingWarnings && fitProgress && <div className="fit-progress"><i style={{ width: `${fitProgress.progress}%` }} /><em>{fitProgress.stage === "compressing" ? "正在压缩口播稿" : fitProgress.stage === "synthesizing" ? "正在重新合成" : "正在校验时长"} · {fitProgress.progress}%</em></div>}
         {!fittingWarnings && fitResult && <small>上次自动修复：已解决 {fitResult.resolvedCount} 个，剩余 {fitResult.remainingIds.length} 个需要确认。</small>}
       </div>
       <div className="duration-task-actions">
         {needsInitialFullTts && !ttsProgressMatch && <Popconfirm title={project?.ttsSyncMode === "semantic" ? "生成语义旁白整片音轨？" : project?.ttsSyncMode === "narration" ? "生成连续旁白整片音轨？" : project?.ttsSyncMode === "balanced" ? "按连续语音块重新生成整片？" : "生成首次全片中文配音？"} description={project?.ttsSyncMode === "semantic" ? "阿里百炼会接收场景文字与字幕用于语义改写；项目当前语音服务只接收中文口播稿和合成参数。不上传原视频或原声，在线服务可能产生费用。" : project?.ttsSyncMode === "narration" ? "将仅向阿里百炼发送中文旁白章节和合成参数，在线服务可能产生费用。" : project?.ttsSyncMode === "balanced" ? "将使用项目当前语音服务按 5–15 秒连续语音块合成，在线服务可能产生费用。" : `将使用项目当前服务商生成 ${segments.length} 个片段，在线服务可能产生费用。`} okText="开始生成" cancelText="取消" onConfirm={regenerateAll}><Button type="primary">{project?.ttsSyncMode === "semantic" ? "生成语义旁白整片配音" : project?.ttsSyncMode === "narration" ? "生成连续旁白整片配音" : project?.ttsSyncMode === "balanced" ? "生成平衡模式整片配音" : "首次生成整片配音"}</Button></Popconfirm>}
-        {timingWarnings.length > 0 && <Button type="primary" loading={fittingWarnings} onClick={() => onFitWarnings()}>{fittingWarnings ? "正在自动修复" : `自动修复 ${timingWarnings.length} 个片段`}</Button>}
-        {!needsInitialFullTts && (blockingFailures.length > 0 || timingWarnings.length > 0) && <Button onClick={() => selectIssue(blockingFailures.length ? "failed" : "timing")}>{blockingFailures.length ? "定位失败片段" : "逐个检查"}</Button>}
+        {!needsInitialFullTts && blockingFailures.length > 0 && <Button type="primary" onClick={() => selectIssue("failed")}>{`处理 ${blockingFailures.length} 个失败片段`}</Button>}
+        {timingWarnings.length > 0 && <Button type={blockingFailures.length ? "default" : "primary"} loading={fittingWarnings} onClick={() => onFitWarnings()}>{fittingWarnings ? "正在自动修复" : `修复 ${timingWarnings.length} 个时长问题`}</Button>}
+        {!needsInitialFullTts && blockingFailures.length === 0 && timingWarnings.length > 0 && <Button onClick={() => selectIssue("timing")}>逐个检查</Button>}
         {fitResult?.undoAvailable && <Button onClick={onUndoFit}>撤销自动修复</Button>}
-        {(timingWarnings.length > 0 || needsInitialFullTts) && <Tooltip title={needsInitialFullTts ? "首次整片生成会建立可复用的片段缓存；之后只需重新生成有修改或失败的片段。" : "翻译后的中文通常比原语音更长。系统会优先精简口播稿；常规加速最高 1.08x，极短片段可在 1.25x 内兜底适配。"}><Button type="text">为什么会出现</Button></Tooltip>}
+        {(blockingFailures.length > 0 || timingWarnings.length > 0 || needsInitialFullTts) && <Tooltip title={needsInitialFullTts ? "首次整片生成会建立可复用的片段缓存；之后只需重新生成有修改或失败的片段。" : issueHelp}><Button type="text">处理说明</Button></Tooltip>}
       </div>
     </section>}
     <div className="editor-stage">
@@ -535,7 +560,7 @@ export const EditorPage = memo(function EditorPage({ active, onCreate, onExport,
         </div>
         <div className="playback-bar"><PlaybackTime durationMs={project?.durationMs ?? 0} videoRef={videoRef} /><div className="transport"><Tooltip title="上一片段"><Button type="text" shape="circle" icon={<BackIcon />} aria-label="上一片段" onClick={() => { const index = segments.findIndex((segment) => segment.id === selectedId); if (index > 0) selectSegment(segments[index - 1].id); }} /></Tooltip><Tooltip title={playing ? "暂停" : "播放"}><Button className="play-button" type="text" shape="circle" icon={playing ? <PauseIcon /> : <PlayIcon />} aria-label={playing ? "暂停" : "播放"} onClick={togglePlayback} /></Tooltip><Tooltip title="下一片段"><Button type="text" shape="circle" icon={<ForwardIcon />} aria-label="下一片段" onClick={() => { const index = segments.findIndex((segment) => segment.id === selectedId); if (index < segments.length - 1) selectSegment(segments[index + 1].id); }} /></Tooltip></div><PlaybackOptions muted={muted} videoRef={videoRef} /></div>
       </section>
-      <Timeline />
+      <Timeline audioMode={project?.audioMode} />
       <Inspector onRegenerate={regenerateSegment} onSmartFit={(segmentId) => onFitWarnings([segmentId])} regenerating={regeneratingSegmentId === selectedId} onPreviewVoice={desktopBridge.isDesktop() ? previewVoice : undefined} onRunDirector={desktopBridge.isDesktop() ? runDirector : undefined} onProjectVoiceChange={changeProjectVoice} voices={voices} syncMode={project?.ttsSyncMode ?? "strict"} syncBlockSize={currentSyncUnit.length} syncBlockDurationMs={currentSyncUnit.length ? currentSyncUnit.at(-1)!.endMs - currentSyncUnit[0].startMs : 0} onSyncModeChange={changeSyncMode} />
     </div>
     <footer className="editor-statusbar"><span>项目帧率&nbsp; 30 fps</span><span>音频采样率&nbsp; 48 kHz</span><span>片段总数&nbsp; {segments.length}</span><span>已处理&nbsp; {segments.filter((segment) => segment.status === "ready").length}</span><span>待处理&nbsp; {segments.filter((segment) => segment.status !== "ready").length}</span><em>存储空间&nbsp; 本地 1.23 TB 可用 <i /></em></footer>

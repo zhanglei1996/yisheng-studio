@@ -4,7 +4,7 @@ import type { GlossaryTerm, Job, Project, Segment } from "./domain";
 export { courseFrame };
 
 export const projects: Project[] = [
-  { id: "p1", name: "Building Reliable AI Agents", duration: "24:18", progress: 78, status: "waiting_user", updatedAt: "今天 10:42", thumbnail: courseFrame, segmentCount: 48 },
+  { id: "p1", name: "Building Reliable AI Agents", duration: "24:18", progress: 78, status: "waiting_user", updatedAt: "今天 10:42", thumbnail: courseFrame, segmentCount: 48, workflowMode: "quick", ttsProviderId: "system", ttsVoiceId: "Tingting", ttsSyncMode: "strict" },
   { id: "p2", name: "React Server Components 深度解析", duration: "18:36", progress: 100, status: "ready", updatedAt: "昨天 18:20", thumbnail: courseFrame, segmentCount: 36 },
   { id: "p3", name: "RAG From Scratch", duration: "42:07", progress: 36, status: "processing", updatedAt: "8 月 10 日", thumbnail: courseFrame, segmentCount: 82 },
 ];
@@ -26,6 +26,6 @@ export const glossaryTerms: GlossaryTerm[] = [
 
 export const jobs: Job[] = [
   { id: "j1", projectId: "p3", project: "RAG From Scratch", stage: "本地语音识别", progress: 36, status: "running", eta: "约 08:20" },
-  { id: "j2", projectId: "p1", project: "Building Reliable AI Agents", stage: "等待文本确认", progress: 78, status: "waiting_user", eta: "—" },
+  { id: "j2", projectId: "p1", project: "Building Reliable AI Agents", stage: "中文配音", progress: 80, status: "paused", eta: "已切换本地缓存音轨", synthesisLabel: "macOS 系统语音 · Tingting · 严格同步 · 缓存音轨 4/4 · 未重复合成" },
   { id: "j3", project: "LLM Evaluation Methods", stage: "等待队列", progress: 0, status: "queued", eta: "约 31 分钟后" },
 ];

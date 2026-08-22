@@ -1,11 +1,12 @@
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, types::Type, Connection, OptionalExtension};
 
 use crate::{
     domain::{
-        ArtifactRecord, GlossaryTerm, JobStatus, JobSummary, NarrationScene, NonSpeechEvent,
-        ProjectStatus, ProjectSummary, ProviderProfile, SegmentRecord, SyncAnchor, TimelineEdit,
+        ArtifactRecord, GlossaryTerm, JobStage, JobStatus, JobSummary, NarrationScene,
+        NonSpeechEvent, ProjectStatus, ProjectSummary, ProviderProfile, SegmentRecord, SyncAnchor,
+        TimelineEdit,
     },
     error::AppError,
     script::{Origin, ScriptDocumentV1},
@@ -25,8 +26,6 @@ pub struct TtsSegmentSnapshot {
     pub spoken_zh: String,
     pub script_doc_json: String,
     pub tts_overrides_json: String,
-    pub tts_state: String,
-    pub tts_settings_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +62,7 @@ impl Database {
         let database = Self { connection };
         database.migrate()?;
         database.recover_interrupted_jobs()?;
+        crate::infrastructure::workflow_store::recover_interrupted(&database.connection)?;
         Ok(database)
     }
 
@@ -332,6 +332,7 @@ impl Database {
                  INSERT OR IGNORE INTO app_migrations(version) VALUES (3);
                  INSERT OR IGNORE INTO app_migrations(version) VALUES (4);",
             )?;
+            crate::infrastructure::workflow_store::migrate(&self.connection)?;
             Ok(())
         })();
         match result {
@@ -775,14 +776,16 @@ impl Database {
         if !matches!(sync_mode, "strict" | "balanced" | "narration" | "semantic") {
             return Err(AppError::Validation("未知的配音同步模式".into()));
         }
-        let previous_provider_id = self
-            .connection
-            .query_row(
-                "SELECT tts_provider_id FROM projects WHERE id=?1",
-                [project_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        let previous = self.get_project(project_id)?;
+        if previous.tts_provider_id == provider_id
+            && previous.tts_voice_id.as_deref() == voice_id
+            && previous.tts_style == style
+            && previous.tts_settings_json == settings_json
+            && previous.tts_director_enabled == director_enabled
+            && previous.tts_sync_mode == sync_mode
+        {
+            return Ok(previous);
+        }
         let updated = self.connection.execute(
             "UPDATE projects SET tts_provider_id=?2, tts_voice_id=?3, tts_style=?4,
              tts_settings_json=?5, tts_director_enabled=?6, tts_sync_mode=?7,
@@ -801,7 +804,7 @@ impl Database {
         if updated == 0 {
             return Err(AppError::NotFound(project_id.into()));
         }
-        if previous_provider_id.as_deref() != Some(provider_id) {
+        if previous.tts_provider_id != provider_id {
             // A voice identifier belongs to a provider-specific namespace.
             // Preserve delivery/style overrides, but never carry an Aliyun
             // voice such as `Cherry` into an iFLYTEK request (or vice versa).
@@ -1239,8 +1242,6 @@ impl Database {
                     spoken_zh: segment.spoken_zh,
                     script_doc_json: segment.script_doc_json,
                     tts_overrides_json: segment.tts_overrides_json,
-                    tts_state: segment.tts_state,
-                    tts_settings_hash: segment.tts_settings_hash,
                 })
                 .collect(),
         })
@@ -1289,8 +1290,6 @@ impl Database {
                 spoken_zh: segment.spoken_zh,
                 script_doc_json: segment.script_doc_json,
                 tts_overrides_json: segment.tts_overrides_json,
-                tts_state: segment.tts_state,
-                tts_settings_hash: segment.tts_settings_hash,
             })
             .collect::<Vec<_>>();
         if current != snapshot.segments {
@@ -1636,7 +1635,7 @@ impl Database {
     pub fn enqueue_job(&self, job: &JobSummary) -> Result<(), AppError> {
         self.connection.execute(
             "INSERT INTO jobs (id, project_id, stage, progress, status, checkpoint) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![job.id, job.project_id, job.stage, job.progress, job_status(&job.status), job.checkpoint],
+            params![job.id, job.project_id, job.stage.as_str(), job.progress, job_status(&job.status), job.checkpoint],
         )?;
         self.connection.execute(
             "UPDATE projects SET status='processing', updated_at=CURRENT_TIMESTAMP WHERE id=?1",
@@ -1654,7 +1653,7 @@ impl Database {
             Ok(JobSummary {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                stage: row.get(2)?,
+                stage: parse_job_stage(&row.get::<_, String>(2)?, 2)?,
                 progress: row.get::<_, i64>(3)?.clamp(0, 100) as u8,
                 status: parse_job_status(&row.get::<_, String>(4)?),
                 checkpoint: row.get(5)?,
@@ -1711,12 +1710,12 @@ impl Database {
     pub fn prepare_tts_job(&self, id: &str) -> Result<(), AppError> {
         let current = self.get_job(id)?;
         match current.status {
-            JobStatus::Succeeded => self.reopen_job(id, "tts", 63, "tts:started")?,
+            JobStatus::Succeeded => self.reopen_job(id, JobStage::Tts, 63, "tts:started")?,
             JobStatus::Paused | JobStatus::Failed | JobStatus::WaitingUser => {
                 self.transition_job(id, JobStatus::Queued)?;
                 self.connection.execute(
-                    "UPDATE jobs SET stage='tts', progress=63, checkpoint='tts:started', error_message=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND status='queued'",
-                    [id],
+                    "UPDATE jobs SET stage=?2, progress=63, checkpoint='tts:started', error_message=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND status='queued'",
+                    params![id, JobStage::Tts.as_str()],
                 )?;
             }
             JobStatus::Queued => {}
@@ -1735,13 +1734,13 @@ impl Database {
     pub fn handoff_running_job(
         &self,
         id: &str,
-        stage: &str,
+        stage: JobStage,
         progress: u8,
         checkpoint: &str,
     ) -> Result<(), AppError> {
         let updated = self.connection.execute(
             "UPDATE jobs SET status='queued', stage=?2, progress=?3, checkpoint=?4, error_message=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND status='running'",
-            params![id, stage, progress, checkpoint],
+            params![id, stage.as_str(), progress, checkpoint],
         )?;
         if updated == 0 {
             return Err(AppError::Validation("任务阶段交接时状态已变化".into()));
@@ -1752,13 +1751,13 @@ impl Database {
     pub fn reopen_job(
         &self,
         id: &str,
-        stage: &str,
+        stage: JobStage,
         progress: u8,
         checkpoint: &str,
     ) -> Result<(), AppError> {
         let updated = self.connection.execute(
             "UPDATE jobs SET status='queued', stage=?2, progress=?3, checkpoint=?4, error_message=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND status='succeeded'",
-            params![id, stage, progress.min(100), checkpoint],
+            params![id, stage.as_str(), progress.min(100), checkpoint],
         )?;
         if updated == 0 {
             return Err(AppError::Validation(
@@ -1772,14 +1771,14 @@ impl Database {
     pub fn checkpoint_job(
         &self,
         id: &str,
-        stage: &str,
+        stage: JobStage,
         progress: u8,
         checkpoint: &str,
     ) -> Result<(), AppError> {
         let updated = self.connection.execute(
             "UPDATE jobs SET stage=?2, progress=MAX(progress, ?3), checkpoint=?4, updated_at=CURRENT_TIMESTAMP
              WHERE id=?1 AND status='running'",
-            params![id, stage, progress.min(100), checkpoint],
+            params![id, stage.as_str(), progress.min(100), checkpoint],
         )?;
         if updated == 0 {
             let exists: bool = self.connection.query_row(
@@ -1870,7 +1869,7 @@ impl Database {
             "SELECT id, project_id, stage, progress, status, checkpoint, error_message, created_at, updated_at FROM jobs WHERE id=?1",
             [id],
             |row| Ok(JobSummary {
-                id: row.get(0)?, project_id: row.get(1)?, stage: row.get(2)?,
+                id: row.get(0)?, project_id: row.get(1)?, stage: parse_job_stage(&row.get::<_, String>(2)?, 2)?,
                 progress: row.get::<_, i64>(3)?.clamp(0, 100) as u8,
                 status: parse_job_status(&row.get::<_, String>(4)?), checkpoint: row.get(5)?,
                 error_message: row.get(6)?, created_at: row.get(7)?, updated_at: row.get(8)?,
@@ -2018,6 +2017,19 @@ fn parse_job_status(value: &str) -> JobStatus {
     }
 }
 
+fn parse_job_stage(value: &str, column: usize) -> Result<JobStage, rusqlite::Error> {
+    JobStage::try_from(value).map_err(|message| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            )),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2025,6 +2037,8 @@ mod tests {
         ArtifactRecord, JobStatus, NarrationScene, NonSpeechEvent, ProviderProfile, SegmentRecord,
         SyncAnchor, TimelineEdit,
     };
+    #[path = "db_regression_tests.rs"]
+    mod regression_tests;
 
     fn segment(id: &str, ordinal: i64, start_ms: i64, end_ms: i64) -> SegmentRecord {
         SegmentRecord {
@@ -2219,7 +2233,7 @@ mod tests {
             db.enqueue_job(&JobSummary {
                 id: id.into(),
                 project_id: "p1".into(),
-                stage: "media_check".into(),
+                stage: JobStage::MediaCheck,
                 progress: 0,
                 status: JobStatus::Queued,
                 checkpoint: None,
@@ -2231,7 +2245,7 @@ mod tests {
         }
         db.start_job("j1").unwrap();
         assert!(db.start_job("j2").is_err());
-        db.checkpoint_job("j1", "proxy", 20, "artifact:proxy")
+        db.checkpoint_job("j1", JobStage::Proxy, 20, "artifact:proxy")
             .unwrap();
     }
 
@@ -2242,7 +2256,7 @@ mod tests {
         db.enqueue_job(&JobSummary {
             id: "j1".into(),
             project_id: "p1".into(),
-            stage: "media_check".into(),
+            stage: JobStage::MediaCheck,
             progress: 0,
             status: JobStatus::Queued,
             checkpoint: None,
@@ -2252,7 +2266,8 @@ mod tests {
         })
         .unwrap();
         db.start_job("j1").unwrap();
-        db.checkpoint_job("j1", "asr", 35, "word:420").unwrap();
+        db.checkpoint_job("j1", JobStage::Asr, 35, "word:420")
+            .unwrap();
         db.transition_job("j1", JobStatus::Paused).unwrap();
         let job = db.list_jobs().unwrap().remove(0);
         assert_eq!(job.status, JobStatus::Paused);
@@ -2263,13 +2278,29 @@ mod tests {
     }
 
     #[test]
+    fn unknown_persisted_job_stage_is_rejected_at_the_database_boundary() {
+        let db = Database::memory().unwrap();
+        db.create_project("p-invalid-stage", "Invalid stage")
+            .unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO jobs (id, project_id, stage, progress, status) VALUES (?1, ?2, ?3, 0, 'queued')",
+                params!["j-invalid-stage", "p-invalid-stage", "guessed_future_stage"],
+            )
+            .unwrap();
+
+        let error = db.list_jobs().unwrap_err().to_string();
+        assert!(error.contains("未知任务阶段"), "unexpected error: {error}");
+    }
+
+    #[test]
     fn running_job_checkpoints_never_move_progress_backwards() {
         let db = Database::memory().unwrap();
         db.create_project("p-progress", "Progress").unwrap();
         db.enqueue_job(&JobSummary {
             id: "j-progress".into(),
             project_id: "p-progress".into(),
-            stage: "translation".into(),
+            stage: JobStage::Translation,
             progress: 0,
             status: JobStatus::Queued,
             checkpoint: Some("queued".into()),
@@ -2279,14 +2310,19 @@ mod tests {
         })
         .unwrap();
         db.start_job("j-progress").unwrap();
-        db.checkpoint_job("j-progress", "script_director", 65, "director:complete")
-            .unwrap();
-        db.checkpoint_job("j-progress", "tts", 57, "tts:started")
+        db.checkpoint_job(
+            "j-progress",
+            JobStage::ScriptDirector,
+            65,
+            "director:complete",
+        )
+        .unwrap();
+        db.checkpoint_job("j-progress", JobStage::Tts, 57, "tts:started")
             .unwrap();
 
         assert_eq!(db.get_job("j-progress").unwrap().progress, 65);
         assert_eq!(db.get_project("p-progress").unwrap().progress, 65);
-        assert_eq!(db.get_job("j-progress").unwrap().stage, "tts");
+        assert_eq!(db.get_job("j-progress").unwrap().stage, JobStage::Tts);
     }
 
     #[test]
@@ -2301,7 +2337,7 @@ mod tests {
         let job = JobSummary {
             id: "j-delete".into(),
             project_id: "p-delete".into(),
-            stage: "asr".into(),
+            stage: JobStage::Asr,
             progress: 0,
             status: JobStatus::Queued,
             checkpoint: None,
@@ -2340,7 +2376,7 @@ mod tests {
         db.enqueue_job(&JobSummary {
             id: "j1".into(),
             project_id: "p1".into(),
-            stage: "tts".into(),
+            stage: JobStage::Tts,
             progress: 80,
             status: JobStatus::Queued,
             checkpoint: None,
@@ -2368,7 +2404,7 @@ mod tests {
             db.enqueue_job(&JobSummary {
                 id: "j1".into(),
                 project_id: "p1".into(),
-                stage: "asr".into(),
+                stage: JobStage::Asr,
                 progress: 41,
                 status: JobStatus::Queued,
                 checkpoint: Some("word:900".into()),
@@ -2552,7 +2588,7 @@ mod tests {
         db.enqueue_job(&JobSummary {
             id: "j-tts".into(),
             project_id: "p1".into(),
-            stage: "tts".into(),
+            stage: JobStage::Tts,
             progress: 57,
             status: JobStatus::Queued,
             checkpoint: None,
@@ -2573,7 +2609,9 @@ mod tests {
         let snapshot = db.capture_tts_publish_snapshot("p1", 1).unwrap();
         db.transition_job("j-tts", JobStatus::Cancelled).unwrap();
 
-        assert!(db.checkpoint_job("j-tts", "tts", 70, "tts:late").is_err());
+        assert!(db
+            .checkpoint_job("j-tts", JobStage::Tts, 70, "tts:late")
+            .is_err());
         assert!(db
             .commit_tts_publication(
                 "j-tts",

@@ -5,11 +5,11 @@ use std::{
     process::Command,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    domain::{MediaArtifacts, MediaProbe, PreviewMedia, TimelineEdit},
+    domain::{JobStage, MediaArtifacts, MediaProbe, PreviewMedia, TimelineEdit},
     error::AppError,
     timeline_map::TimelineMap,
 };
@@ -114,10 +114,12 @@ pub fn prepare<F>(
     project_id: &str,
     source: &Path,
     root: &Path,
+    audio_mode: &str,
+    source_fingerprint: &str,
     mut progress: F,
 ) -> Result<MediaArtifacts, AppError>
 where
-    F: FnMut(&str, u8, &str) -> Result<(), AppError>,
+    F: FnMut(JobStage, u8, &str) -> Result<(), AppError>,
 {
     let artifact_dir = root.join("projects").join(project_id).join("media");
     std::fs::create_dir_all(&artifact_dir).map_err(|error| AppError::Media(error.to_string()))?;
@@ -126,16 +128,29 @@ where
     ensure_thumbnail(project_id, source, root)?;
 
     if !is_non_empty_file(&audio_path) {
-        progress("audio_extract", 4, "media:extracting-audio")?;
+        progress(JobStage::AudioExtract, 4, "media:extracting-audio")?;
         run_ffmpeg(
             source,
             &audio_path,
             ["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"],
         )?;
     }
-    progress("audio_extract", 8, "media:audio-ready")?;
+    progress(JobStage::AudioExtract, 8, "media:audio-ready")?;
+    if audio_mode == "separate" {
+        progress(
+            JobStage::SourceSeparation,
+            9,
+            "media:safe-mode-separating-local-audio",
+        )?;
+        prepare_safe_background(source, &artifact_dir, root, source_fingerprint)?;
+        progress(
+            JobStage::SourceSeparation,
+            12,
+            "media:safe-background-ready",
+        )?;
+    }
     if !is_non_empty_file(&proxy_path) {
-        progress("proxy", 9, "media:creating-proxy")?;
+        progress(JobStage::Proxy, 13, "media:creating-proxy")?;
         let scale = "scale=min(1280\\,iw):-2";
         run_ffmpeg(
             source,
@@ -178,7 +193,7 @@ where
             )
         })?;
     }
-    progress("proxy", 15, "media:proxy-ready")?;
+    progress(JobStage::Proxy, 15, "media:proxy-ready")?;
 
     Ok(MediaArtifacts {
         project_id: project_id.into(),
@@ -186,6 +201,169 @@ where
         audio_path: audio_path.to_string_lossy().into_owned(),
         artifact_dir: artifact_dir.to_string_lossy().into_owned(),
     })
+}
+
+const SEPARATION_MODEL: &str = "UVR-MDX-NET-Inst_HQ_3.onnx";
+const SEPARATION_RUNTIME_VERSION: &str = "0.44.5";
+pub const SAFE_BACKGROUND_FILE: &str = "background-safe.wav";
+const SAFE_BACKGROUND_MANIFEST: &str = "background-safe.json";
+const DUBBED_PREVIEW_MANIFEST: &str = "dubbed-preview.json";
+const PREVIEW_RECIPE_VERSION: u32 = 2;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SafeBackgroundManifest {
+    source_fingerprint: String,
+    model: String,
+    runtime_version: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DubbedPreviewManifest {
+    audio_mode: String,
+    recipe_version: u32,
+}
+
+pub fn safe_background_is_ready(artifact_dir: &Path, source_fingerprint: &str) -> bool {
+    let output = artifact_dir.join(SAFE_BACKGROUND_FILE);
+    let manifest_path = artifact_dir.join(SAFE_BACKGROUND_MANIFEST);
+    if !is_non_empty_file(&output) || !is_non_empty_file(&manifest_path) {
+        return false;
+    }
+    std::fs::read_to_string(manifest_path)
+        .ok()
+        .and_then(|value| serde_json::from_str::<SafeBackgroundManifest>(&value).ok())
+        .is_some_and(|manifest| {
+            manifest.source_fingerprint == source_fingerprint
+                && manifest.model == SEPARATION_MODEL
+                && manifest.runtime_version == SEPARATION_RUNTIME_VERSION
+        })
+}
+
+pub fn separation_runtime_installed(root: &Path) -> bool {
+    separation_binary(root).is_some()
+}
+
+fn prepare_safe_background(
+    source: &Path,
+    artifact_dir: &Path,
+    root: &Path,
+    source_fingerprint: &str,
+) -> Result<PathBuf, AppError> {
+    let target = artifact_dir.join(SAFE_BACKGROUND_FILE);
+    if safe_background_is_ready(artifact_dir, source_fingerprint) {
+        return Ok(target);
+    }
+    let separator = separation_binary(root).ok_or_else(|| {
+        AppError::Media(
+            "安全模式所需的本地人声分离组件未安装；为避免英文残留，本次处理已停止，没有降级回混原声"
+                .into(),
+        )
+    })?;
+    let source_audio = artifact_dir.join("source-full-stereo.wav");
+    let pending_source_audio = artifact_dir.join("source-full-stereo.pending.wav");
+    let _ = std::fs::remove_file(&pending_source_audio);
+    run_ffmpeg(
+        source,
+        &pending_source_audio,
+        ["-vn", "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le"],
+    )?;
+    std::fs::rename(&pending_source_audio, &source_audio)
+        .map_err(|error| AppError::Media(format!("无法更新本地分离输入：{error}")))?;
+    let model_dir = root.join("models").join("vocal-separation");
+    std::fs::create_dir_all(&model_dir)
+        .map_err(|error| AppError::Media(format!("无法创建本地分离模型目录：{error}")))?;
+    let model_path = model_dir.join(SEPARATION_MODEL);
+    if model_path
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() < 60 * 1024 * 1024)
+    {
+        std::fs::remove_file(&model_path)
+            .map_err(|error| AppError::Media(format!("无法清理未完成的分离模型：{error}")))?;
+    }
+    let pending_dir = artifact_dir.join("safe-separation.pending");
+    if pending_dir.exists() {
+        std::fs::remove_dir_all(&pending_dir)
+            .map_err(|error| AppError::Media(format!("无法清理未完成的分离任务：{error}")))?;
+    }
+    std::fs::create_dir_all(&pending_dir)
+        .map_err(|error| AppError::Media(format!("无法创建本地分离临时目录：{error}")))?;
+    let output = Command::new(separator)
+        .arg(&source_audio)
+        .args(["--model_filename", SEPARATION_MODEL, "--model_file_dir"])
+        .arg(&model_dir)
+        .arg("--output_dir")
+        .arg(&pending_dir)
+        .args(["--output_format", "WAV", "--single_stem", "Instrumental"])
+        .output()
+        .map_err(|error| AppError::Media(format!("无法启动本地人声分离组件：{error}")))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_dir_all(&pending_dir);
+        return Err(AppError::Media(format!(
+            "本地人声分离失败；为避免英文残留，本次处理已停止：{}",
+            sanitize_process_error(&output.stderr)
+        )));
+    }
+    let instrumental = std::fs::read_dir(&pending_dir)
+        .map_err(|error| AppError::Media(format!("无法读取本地分离结果：{error}")))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("wav"))
+                && path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("instrumental"))
+        })
+        .ok_or_else(|| AppError::Media("本地分离未生成背景与音效轨，已阻止继续处理".into()))?;
+    let pending_target = artifact_dir.join("background-safe.pending.wav");
+    let _ = std::fs::remove_file(&pending_target);
+    run_ffmpeg(
+        &instrumental,
+        &pending_target,
+        ["-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le"],
+    )?;
+    std::fs::rename(&pending_target, &target)
+        .map_err(|error| AppError::Media(format!("无法保存安全背景轨：{error}")))?;
+    let manifest = SafeBackgroundManifest {
+        source_fingerprint: source_fingerprint.into(),
+        model: SEPARATION_MODEL.into(),
+        runtime_version: SEPARATION_RUNTIME_VERSION.into(),
+    };
+    let manifest_path = artifact_dir.join(SAFE_BACKGROUND_MANIFEST);
+    let pending_manifest = artifact_dir.join("background-safe.pending.json");
+    std::fs::write(
+        &pending_manifest,
+        serde_json::to_vec_pretty(&manifest)
+            .map_err(|error| AppError::Media(format!("无法记录安全背景轨依赖：{error}")))?,
+    )
+    .map_err(|error| AppError::Media(format!("无法记录安全背景轨依赖：{error}")))?;
+    std::fs::rename(&pending_manifest, manifest_path)
+        .map_err(|error| AppError::Media(format!("无法发布安全背景轨依赖：{error}")))?;
+    let _ = std::fs::remove_dir_all(&pending_dir);
+    Ok(target)
+}
+
+fn separation_binary(root: &Path) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("YISHENG_AUDIO_SEPARATOR").map(PathBuf::from) {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let managed = root
+        .join("runtimes")
+        .join("audio-separator")
+        .join("bin")
+        .join("audio-separator");
+    if managed.is_file() {
+        return Some(managed);
+    }
+    ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+        .into_iter()
+        .map(|directory| Path::new(directory).join("audio-separator"))
+        .find(|path| path.is_file())
 }
 
 /// Return a cached project cover rendered from the source video's first
@@ -230,7 +408,7 @@ pub fn ensure_thumbnail(project_id: &str, source: &Path, root: &Path) -> Result<
     Ok(target)
 }
 
-pub fn resolve_preview(artifact_dir: &Path) -> Result<PreviewMedia, AppError> {
+pub fn resolve_preview(artifact_dir: &Path, audio_mode: &str) -> Result<PreviewMedia, AppError> {
     let proxy = artifact_dir.join("preview-proxy.mp4");
     if !is_non_empty_file(&proxy) {
         return Err(AppError::Media("预览代理尚未生成".into()));
@@ -244,7 +422,13 @@ pub fn resolve_preview(artifact_dir: &Path) -> Result<PreviewMedia, AppError> {
         });
     }
     let dubbed = artifact_dir.join("dubbed-preview.mp4");
-    if is_non_empty_file(&dubbed) && preview_is_current(&dubbed, &[&proxy, &voice]) {
+    let safe_background = artifact_dir.join(SAFE_BACKGROUND_FILE);
+    let dependencies: Vec<&Path> = if audio_mode == "separate" {
+        vec![proxy.as_path(), voice.as_path(), safe_background.as_path()]
+    } else {
+        vec![proxy.as_path(), voice.as_path()]
+    };
+    if dubbed_preview_is_current(artifact_dir, &dubbed, &dependencies, audio_mode) {
         return Ok(PreviewMedia {
             path: dubbed.to_string_lossy().into_owned(),
             dubbed: true,
@@ -258,6 +442,48 @@ pub fn resolve_preview(artifact_dir: &Path) -> Result<PreviewMedia, AppError> {
     })
 }
 
+fn safe_preview_audio_filter() -> &'static str {
+    "[2:a]aformat=sample_rates=48000:channel_layouts=stereo[background];\
+     [1:a]aformat=sample_rates=48000:channel_layouts=stereo,asplit=2[voice_sc][voice_mix];\
+     [background][voice_sc]sidechaincompress=threshold=0.015:ratio=12:attack=12:release=320[ducked];\
+     [ducked][voice_mix]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-16:TP=-1.0:LRA=7[aout]"
+}
+
+fn duck_preview_audio_filter() -> &'static str {
+    "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=0.72[original];\
+     [1:a]aformat=sample_rates=48000:channel_layouts=stereo,asplit=2[voice_sc][voice_mix];\
+     [original][voice_sc]sidechaincompress=threshold=0.015:ratio=18:attack=12:release=360[ducked];\
+     [ducked][voice_mix]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-16:TP=-1.0:LRA=7[aout]"
+}
+
+fn dubbed_preview_is_current(
+    artifact_dir: &Path,
+    target: &Path,
+    dependencies: &[&Path],
+    audio_mode: &str,
+) -> bool {
+    if !is_non_empty_file(target) || !preview_is_current(target, dependencies) {
+        return false;
+    }
+    std::fs::read_to_string(artifact_dir.join(DUBBED_PREVIEW_MANIFEST))
+        .ok()
+        .and_then(|value| serde_json::from_str::<DubbedPreviewManifest>(&value).ok())
+        .is_some_and(|manifest| {
+            manifest.audio_mode == audio_mode && manifest.recipe_version == PREVIEW_RECIPE_VERSION
+        })
+}
+
+fn write_dubbed_preview_manifest(artifact_dir: &Path, audio_mode: &str) -> Result<(), AppError> {
+    let manifest = DubbedPreviewManifest {
+        audio_mode: audio_mode.to_string(),
+        recipe_version: PREVIEW_RECIPE_VERSION,
+    };
+    let payload = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| AppError::Media(format!("无法序列化中文预览缓存信息：{error}")))?;
+    std::fs::write(artifact_dir.join(DUBBED_PREVIEW_MANIFEST), payload)
+        .map_err(|error| AppError::Media(format!("无法写入中文预览缓存信息：{error}")))
+}
+
 pub fn render_dubbed_preview(artifact_dir: &Path, audio_mode: &str) -> Result<PathBuf, AppError> {
     let proxy = artifact_dir.join("preview-proxy.mp4");
     let voice = artifact_dir.join("chinese-voice.wav");
@@ -266,21 +492,41 @@ pub fn render_dubbed_preview(artifact_dir: &Path, audio_mode: &str) -> Result<Pa
             "生成中文预览所需的代理视频或配音音轨缺失".into(),
         ));
     }
+    let safe_background = artifact_dir.join(SAFE_BACKGROUND_FILE);
+    if audio_mode == "separate" && !is_non_empty_file(&safe_background) {
+        return Err(AppError::Media(
+            "安全背景轨缺失；为避免英文残留，已阻止生成预览".into(),
+        ));
+    }
     let target = artifact_dir.join("dubbed-preview.mp4");
-    if preview_is_current(&target, &[&proxy, &voice]) {
+    let dependencies: Vec<&Path> = if audio_mode == "separate" {
+        vec![proxy.as_path(), voice.as_path(), safe_background.as_path()]
+    } else {
+        vec![proxy.as_path(), voice.as_path()]
+    };
+    if preview_is_current(&target, &dependencies) {
         return Ok(target);
     }
     let temporary = artifact_dir.join("dubbed-preview.pending.mp4");
     let _ = std::fs::remove_file(&temporary);
-    let source_gain = if audio_mode == "mute" { 0.42 } else { 0.72 };
-    let primary_filter = format!(
-        "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,volume={source_gain:.2}[original];\
-         [1:a]aformat=sample_rates=48000:channel_layouts=stereo[voice];\
-         [original][voice]sidechaincompress=threshold=0.015:ratio=18:attack=12:release=360[ducked];\
-         [ducked][voice]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-16:TP=-1.0:LRA=7[aout]"
-    );
-    let result =
-        render_preview_command(&proxy, &voice, &temporary, &primary_filter).or_else(|_| {
+    let result = if audio_mode == "separate" {
+        render_preview_command_with_background(
+            &proxy,
+            &voice,
+            &safe_background,
+            &temporary,
+            safe_preview_audio_filter(),
+        )
+    } else if audio_mode == "mute" {
+        render_preview_command(
+            &proxy,
+            &voice,
+            &temporary,
+            "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,loudnorm=I=-16:TP=-1.0:LRA=7[aout]",
+        )
+    } else {
+        let primary_filter = duck_preview_audio_filter();
+        render_preview_command(&proxy, &voice, &temporary, primary_filter).or_else(|_| {
             let _ = std::fs::remove_file(&temporary);
             render_preview_command(
                 &proxy,
@@ -288,13 +534,15 @@ pub fn render_dubbed_preview(artifact_dir: &Path, audio_mode: &str) -> Result<Pa
                 &temporary,
                 "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=1[aout]",
             )
-        });
+        })
+    };
     if let Err(error) = result {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
     }
     std::fs::rename(&temporary, &target)
         .map_err(|error| AppError::Media(format!("无法更新中文预览：{error}")))?;
+    write_dubbed_preview_manifest(artifact_dir, audio_mode)?;
     Ok(target)
 }
 
@@ -303,13 +551,30 @@ pub fn render_dubbed_preview(artifact_dir: &Path, audio_mode: &str) -> Result<Pa
 /// proxy instead of surfacing an error toast. Actual FFmpeg failures still
 /// propagate once both dependencies are present.
 pub fn prepare_preview(artifact_dir: &Path, audio_mode: &str) -> Result<PreviewMedia, AppError> {
-    let current = resolve_preview(artifact_dir)?;
-    if current.dubbed {
-        return Ok(current);
-    }
+    let current = resolve_preview(artifact_dir, audio_mode)?;
     let voice = artifact_dir.join("chinese-voice.wav");
     if !is_non_empty_file(&voice) {
         return Ok(current);
+    }
+    if current.dubbed {
+        if audio_mode != "separate" {
+            return Ok(current);
+        }
+        let safe_background = artifact_dir.join(SAFE_BACKGROUND_FILE);
+        if is_non_empty_file(&safe_background)
+            && dubbed_preview_is_current(
+                artifact_dir,
+                Path::new(&current.path),
+                &[
+                    proxy_path(artifact_dir).as_path(),
+                    voice.as_path(),
+                    safe_background.as_path(),
+                ],
+                audio_mode,
+            )
+        {
+            return Ok(current);
+        }
     }
     match render_dubbed_preview(artifact_dir, audio_mode) {
         Ok(path) => Ok(PreviewMedia {
@@ -318,10 +583,14 @@ pub fn prepare_preview(artifact_dir: &Path, audio_mode: &str) -> Result<PreviewM
             dubbed: true,
         }),
         Err(AppError::Media(message)) if message == "生成中文预览所需的代理视频或配音音轨缺失" => {
-            resolve_preview(artifact_dir)
+            resolve_preview(artifact_dir, audio_mode)
         }
         Err(error) => Err(error),
     }
+}
+
+fn proxy_path(artifact_dir: &Path) -> PathBuf {
+    artifact_dir.join("preview-proxy.mp4")
 }
 
 pub fn prepare_timeline_preview(
@@ -410,6 +679,8 @@ fn render_preview_command(
             "aac",
             "-b:a",
             "160k",
+            "-ar",
+            "48000",
             "-movflags",
             "+faststart",
         ])
@@ -421,6 +692,51 @@ fn render_preview_command(
     } else {
         Err(AppError::Media(format!(
             "中文预览合成失败：{}",
+            sanitize_process_error(&output.stderr)
+        )))
+    }
+}
+
+fn render_preview_command_with_background(
+    proxy: &Path,
+    voice: &Path,
+    background: &Path,
+    target: &Path,
+    audio_filter: &str,
+) -> Result<(), AppError> {
+    let output = Command::new(resolve_binary("ffmpeg"))
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(proxy)
+        .arg("-i")
+        .arg(voice)
+        .arg("-i")
+        .arg(background)
+        .args([
+            "-filter_complex",
+            audio_filter,
+            "-map",
+            "0:v:0",
+            "-map",
+            "[aout]",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-ar",
+            "48000",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(target)
+        .output()
+        .map_err(|error| AppError::Media(format!("无法启动安全模式预览合成：{error}")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(AppError::Media(format!(
+            "安全模式预览合成失败：{}",
             sanitize_process_error(&output.stderr)
         )))
     }
@@ -518,7 +834,10 @@ fn sanitize_process_error(stderr: &[u8]) -> String {
 mod tests {
     use super::{
         ensure_thumbnail, prepare, prepare_preview, probe, resolve_binary, resolve_preview,
-        sanitize_process_error,
+        safe_background_is_ready, safe_preview_audio_filter, sanitize_process_error,
+        DubbedPreviewManifest, SafeBackgroundManifest, DUBBED_PREVIEW_MANIFEST,
+        PREVIEW_RECIPE_VERSION, SAFE_BACKGROUND_FILE, SAFE_BACKGROUND_MANIFEST, SEPARATION_MODEL,
+        SEPARATION_RUNTIME_VERSION,
     };
     use std::io::Write;
     use std::process::Command;
@@ -530,6 +849,30 @@ mod tests {
     }
 
     #[test]
+    fn safe_background_cache_requires_matching_source_and_model_manifest() {
+        let output = std::env::temp_dir().join(format!(
+            "yisheng-safe-background-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join(SAFE_BACKGROUND_FILE), b"background").unwrap();
+        let manifest = SafeBackgroundManifest {
+            source_fingerprint: "source-a".into(),
+            model: SEPARATION_MODEL.into(),
+            runtime_version: SEPARATION_RUNTIME_VERSION.into(),
+        };
+        std::fs::write(
+            output.join(SAFE_BACKGROUND_MANIFEST),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert!(safe_background_is_ready(&output, "source-a"));
+        assert!(!safe_background_is_ready(&output, "source-b"));
+        std::fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
     fn resolving_preview_never_renders_on_the_read_path() {
         let output =
             std::env::temp_dir().join(format!("yisheng-preview-read-{}", uuid::Uuid::new_v4()));
@@ -538,7 +881,7 @@ mod tests {
             let mut file = std::fs::File::create(output.join(name)).unwrap();
             file.write_all(b"fixture").unwrap();
         }
-        let preview = resolve_preview(&output).unwrap();
+        let preview = resolve_preview(&output, "duck").unwrap();
         assert!(!preview.dubbed);
         assert!(preview.path.ends_with("preview-proxy.mp4"));
         assert!(!output.join("dubbed-preview.mp4").exists());
@@ -575,12 +918,62 @@ mod tests {
         let mut file = std::fs::File::create(&target).unwrap();
         file.write_all(b"dubbed").unwrap();
         drop(file);
+        std::fs::write(
+            output.join(DUBBED_PREVIEW_MANIFEST),
+            serde_json::to_vec(&DubbedPreviewManifest {
+                audio_mode: "duck".into(),
+                recipe_version: PREVIEW_RECIPE_VERSION,
+            })
+            .unwrap(),
+        )
+        .unwrap();
         let before = target.metadata().unwrap().modified().unwrap();
-        let preview = resolve_preview(&output).unwrap();
+        let preview = resolve_preview(&output, "duck").unwrap();
         let after = target.metadata().unwrap().modified().unwrap();
         assert!(preview.dubbed);
         assert_eq!(preview.path, target.to_string_lossy());
         assert_eq!(before, after);
+        std::fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn safe_preview_splits_voice_before_sidechain_and_mix() {
+        let filter = safe_preview_audio_filter();
+        assert!(filter.contains("asplit=2[voice_sc][voice_mix]"));
+        assert!(filter.contains("[background][voice_sc]sidechaincompress"));
+        assert!(filter.contains("[ducked][voice_mix]amix"));
+        assert!(!filter.contains("[background][voice]sidechaincompress"));
+    }
+
+    #[test]
+    fn resolving_preview_rejects_a_manifest_from_an_old_mix_recipe() {
+        let output = std::env::temp_dir().join(format!(
+            "yisheng-preview-old-recipe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&output).unwrap();
+        for name in [
+            "preview-proxy.mp4",
+            "chinese-voice.wav",
+            SAFE_BACKGROUND_FILE,
+        ] {
+            std::fs::write(output.join(name), b"fixture").unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(output.join("dubbed-preview.mp4"), b"fixture").unwrap();
+        std::fs::write(
+            output.join(DUBBED_PREVIEW_MANIFEST),
+            serde_json::to_vec(&DubbedPreviewManifest {
+                audio_mode: "separate".into(),
+                recipe_version: PREVIEW_RECIPE_VERSION - 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let preview = resolve_preview(&output, "separate").unwrap();
+        assert!(!preview.dubbed);
+        assert!(preview.path.ends_with("preview-proxy.mp4"));
         std::fs::remove_dir_all(output).unwrap();
     }
 
@@ -629,10 +1022,17 @@ mod tests {
         let output =
             std::env::temp_dir().join(format!("yisheng-media-qa-{}", uuid::Uuid::new_v4()));
         let mut stages = Vec::new();
-        let artifacts = prepare("sample", source, &output, |stage, value, _| {
-            stages.push((stage.to_string(), value));
-            Ok(())
-        })
+        let artifacts = prepare(
+            "sample",
+            source,
+            &output,
+            "duck",
+            &metadata.fingerprint,
+            |stage, value, _| {
+                stages.push((stage.to_string(), value));
+                Ok(())
+            },
+        )
         .unwrap();
         assert!(
             std::path::Path::new(&artifacts.audio_path)

@@ -28,6 +28,8 @@ export function ExportDialog({ open, onClose, onResolveIssues, projectId }: { op
   const { data: preflight, isLoading: checking } = useQuery({ queryKey: ["export-preflight", projectId], queryFn: () => desktopBridge.getExportPreflight(projectId!), enabled: open && Boolean(projectId) });
   const project = projects.find((item) => item.id === projectId);
   const durationSeconds = (project?.durationMs ?? 0) / 1000;
+  const durationMinutes = Math.max(1, Math.ceil(durationSeconds / 60));
+  const estimatedMinutes = Math.max(1, Math.ceil(durationSeconds / 180));
   const presetBitrate = exportPreset === "share" ? 1_800_000 : exportPreset === "high" ? 5_000_000 : 2_800_000;
   const estimatedBytes = durationSeconds * ((presetBitrate + 192_000) / 8 + 48_000 * 2);
   const estimatedOutput = estimatedBytes > 0 ? `约 ${Math.max(1, Math.round(estimatedBytes / 1024 / 1024))} MiB` : "将在开始前计算";
@@ -57,12 +59,18 @@ export function ExportDialog({ open, onClose, onResolveIssues, projectId }: { op
   return (
     <AppModal
       open={open}
-      onCancel={onClose}
+      onCancel={() => {
+        if (exporting) {
+          message.info("成片正在生成，请等导出完成后再关闭");
+          return;
+        }
+        onClose();
+      }}
       width={620}
       title="导出视频"
       footer={done
         ? <Button type="primary" onClick={onClose}>完成</Button>
-        : <><Button onClick={onClose}>取消</Button><Button type="primary" icon={<Export />} loading={exporting || checking} disabled={Boolean(preflight && (!preflight.canExport || (preflight.warningCount > 0 && !warningAcknowledged)))} onClick={start}>{exporting ? "正在准备导出" : preflight?.warningCount && warningAcknowledged ? "仍然导出" : "开始导出"}</Button></>}
+        : <><Button disabled={exporting} onClick={onClose}>{exporting ? "导出中请稍候" : "取消"}</Button><Button type="primary" icon={<Export />} loading={exporting || checking} disabled={Boolean(preflight && (!preflight.canExport || (preflight.warningCount > 0 && !warningAcknowledged)))} onClick={start}>{exporting ? "正在生成成片" : preflight?.warningCount && warningAcknowledged ? "仍然导出" : "开始导出"}</Button></>}
       className="export-modal"
     >
       {done ? (
@@ -74,6 +82,7 @@ export function ExportDialog({ open, onClose, onResolveIssues, projectId }: { op
         </div>
       ) : (
         <div className="export-form">
+          {exporting && <Alert type="info" showIcon title="正在编码并写入最终视频" description={`本项目约 ${durationMinutes} 分钟，导出预计需要 ${estimatedMinutes}–${estimatedMinutes + 2} 分钟。期间可以继续使用电脑，请不要退出译声工坊。`} />}
           {preflight && !preflight.canExport && <Alert type="error" showIcon title={`${preflight.blockingCount} 个发布问题阻止导出`} description={<div className="preflight-description"><span>{preflight.message}</span><Button danger onClick={() => onResolveIssues?.("failed")}>定位并修复</Button></div>} />}
           {preflight && preflight.canExport && preflight.warningCount > 0 && <Alert type="warning" showIcon title={`${preflight.warningCount} 个发布提醒待确认`} description={<div className="preflight-description"><span>建议先处理字幕闪现、阅读速度或时长问题；确认后仍可导出。</span><div><Button onClick={() => onResolveIssues?.("timing")}>返回自动修复</Button><Button type={warningAcknowledged ? "primary" : "default"} onClick={() => setWarningAcknowledged(true)}>{warningAcknowledged ? "已确认风险" : "仍然导出"}</Button></div></div>} />}
           {preflight && preflight.canExport && preflight.warningCount === 0 && <Alert type="success" showIcon title="项目已通过发布检查" description="配音版本、非语音事件、字幕可读性与时间线当前均可安全导出。" />}
@@ -98,7 +107,7 @@ export function ExportDialog({ open, onClose, onResolveIssues, projectId }: { op
           <div className="export-package refined">
             <h3>默认导出包</h3>
             {[
-              [FileVideo, "中文配音视频", "MP4 · H.264 VideoToolbox · AAC · 1080p"],
+              [FileVideo, "中文配音视频", "MP4 · H.264 VideoToolbox · AAC · 本地预览画质（最高 720p）"],
               [FileText, "字幕文件", "配音同步 SRT · 忠实翻译 SRT · 英文 SRT · 双语 ASS"],
               [FileAudio, "独立中文音轨", "WAV · 48 kHz"],
             ].map(([Icon, title, description]) => {

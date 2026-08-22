@@ -136,7 +136,7 @@ yt-dlp -t mp4 --yes-playlist \
 
 ```bash
 yt-dlp -t mp4 --no-playlist \
-  -P "/Users/mac/Documents/ChatGPT/多语言视频转中文配音/downloads" \
+  -P "./downloads" \
   -o "%(title)s [%(id)s].%(ext)s" \
   "视频链接"
 ```

@@ -3,6 +3,11 @@ use crate::{
     error::AppError,
     timeline_map::TimelineMap,
 };
+#[path = "export_support.rs"]
+mod export_support;
+use export_support::{
+    available_export_directory, escape_filter_path, ffmpeg, resolve_export_video_source, safe_name,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -60,7 +65,7 @@ pub fn export(
     subtitle_mode: &str,
     export_preset: &str,
 ) -> Result<ExportOutput, AppError> {
-    let source = PathBuf::from(
+    let original_source = PathBuf::from(
         project
             .source_path
             .as_ref()
@@ -72,6 +77,9 @@ pub fn export(
             .as_ref()
             .ok_or_else(|| AppError::Media("项目产物目录丢失".into()))?,
     );
+    // Media preparation publishes a durable local proxy. Exporting from it avoids
+    // depending on a transient macOS file-picker permission after an app restart.
+    let source = resolve_export_video_source(&artifacts, &original_source);
     let voice = artifacts.join("chinese-voice.wav");
     if !voice.is_file() {
         return Err(AppError::Media("请先完成中文配音".into()));
@@ -80,8 +88,12 @@ pub fn export(
         .duration_ms
         .unwrap_or_else(|| segments.last().map_or(0, |segment| segment.end_ms));
     let timeline_map = TimelineMap::from_edits(source_duration_ms, timeline_edits)?;
-    let directory = available_export_directory(output_root, &safe_name(&project.name));
-    std::fs::create_dir_all(&directory).map_err(|e| AppError::Media(e.to_string()))?;
+    let final_directory = available_export_directory(output_root, &safe_name(&project.name));
+    let staging =
+        crate::infrastructure::artifact_publisher::AtomicArtifactPublisher::stage_directory(
+            &final_directory,
+        )?;
+    let directory = staging.path().to_path_buf();
     let en = directory.join("英文字幕.srt");
     let zh = directory.join("中文字幕.srt");
     let ass = directory.join("中英双语.ass");
@@ -93,12 +105,8 @@ pub fn export(
         .map_err(|e| AppError::Media(e.to_string()))?;
     std::fs::write(&ass, mapped_ass_text(segments, &timeline_map))
         .map_err(|e| AppError::Media(e.to_string()))?;
-    let dubbing_cues = dubbing_cues(segments, tts_artifacts);
-    let dubbing_cues = if dubbing_cues.is_empty() {
-        fallback_dubbing_cues(segments)
-    } else {
-        dubbing_cues
-    };
+    let dubbing_cues =
+        ensure_complete_dubbing_cues(segments, dubbing_cues(segments, tts_artifacts));
     let dubbing_cues = map_and_stabilize_cues(&dubbing_cues, &timeline_map);
     std::fs::write(&dubbing_zh, dubbing_srt(&dubbing_cues))
         .map_err(|e| AppError::Media(e.to_string()))?;
@@ -106,29 +114,44 @@ pub fn export(
         .map_err(|e| AppError::Media(e.to_string()))?;
     let audio = directory.join("中文配音.wav");
     render_timeline_voice(&voice, &audio, &timeline_map)?;
+    let safe_background = if project.audio_mode == "separate" {
+        let source_background = artifacts.join(crate::media::SAFE_BACKGROUND_FILE);
+        let fingerprint = project.source_fingerprint.as_deref().unwrap_or_default();
+        if !crate::media::safe_background_is_ready(&artifacts, fingerprint) {
+            return Err(AppError::Media(
+                "安全背景轨缺失或已过期；为避免英文残留，已阻止导出".into(),
+            ));
+        }
+        let rendered = directory.join("背景与音效.wav");
+        render_timeline_voice(&source_background, &rendered, &timeline_map)?;
+        Some(rendered)
+    } else {
+        None
+    };
     let video = directory.join("中文配音视频.mp4");
     let mut cmd = Command::new(ffmpeg());
     cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(&source)
         .arg("-i")
         .arg(&audio);
+    if let Some(background) = &safe_background {
+        cmd.arg("-i").arg(background);
+    }
     let edited = timeline_map
         .spans()
         .iter()
         .any(|span| span.operation != "keep");
-    let (video_label, original_audio_label, mut timeline_filter) =
-        media_timeline_filter(&timeline_map, edited);
-    let source_gain = if project.audio_mode == "mute" {
-        0.42
+    let (video_label, timeline_filter) = if project.audio_mode == "duck" {
+        let (video, original_audio, filter) = media_timeline_filter(&timeline_map, edited);
+        (video, (filter, Some(original_audio)))
     } else {
-        0.72
+        let (video, filter) = video_timeline_filter(&timeline_map, edited);
+        (video, (filter, None))
     };
-    timeline_filter.push_str(&format!(
-        "{original_audio_label}volume={source_gain}[original_level];\
-         [original_level][1:a]sidechaincompress=threshold=0.015:ratio=18:attack=12:release=360[ducked];\
-         [ducked][1:a]amix=inputs=2:duration=longest:normalize=0,\
-         loudnorm=I=-16:TP=-1.0:LRA=7[aout]"
-    ));
+    let original_audio_label = timeline_filter.1;
+    let mut timeline_filter = timeline_filter.0;
+    let audio_stage = export_audio_filter(project.audio_mode.as_str(), original_audio_label);
+    append_filter_stage(&mut timeline_filter, &audio_stage);
     let mut video_output_label = video_label.to_string();
     if subtitle_mode != "none" {
         let subtitle = if subtitle_mode == "bilingual" {
@@ -136,10 +159,13 @@ pub fn export(
         } else {
             &dubbing_zh
         };
-        timeline_filter.push_str(&format!(
-            ";{video_label}subtitles='{}'[vsub]",
-            escape_filter_path(subtitle)
-        ));
+        append_filter_stage(
+            &mut timeline_filter,
+            &format!(
+                "{video_label}subtitles='{}'[vsub]",
+                escape_filter_path(subtitle)
+            ),
+        );
         video_output_label = "[vsub]".into();
     }
     cmd.args([
@@ -174,6 +200,8 @@ pub fn export(
         "aac",
         "-b:a",
         "192k",
+        "-ar",
+        "48000",
         "-ac",
         "2",
         "-movflags",
@@ -190,11 +218,69 @@ pub fn export(
                 .join(" "),
         ));
     }
+    let directory = staging.commit()?;
     Ok(ExportOutput {
         directory: directory.to_string_lossy().into_owned(),
-        video_path: video.to_string_lossy().into_owned(),
-        audio_path: audio.to_string_lossy().into_owned(),
+        video_path: directory
+            .join("中文配音视频.mp4")
+            .to_string_lossy()
+            .into_owned(),
+        audio_path: directory
+            .join("中文配音.wav")
+            .to_string_lossy()
+            .into_owned(),
     })
+}
+
+fn append_filter_stage(filter: &mut String, stage: &str) {
+    if !filter.is_empty() && !filter.ends_with(';') {
+        filter.push(';');
+    }
+    filter.push_str(stage);
+}
+
+fn export_audio_filter(audio_mode: &str, original_audio_label: Option<&str>) -> String {
+    match audio_mode {
+        "separate" => "[2:a]aformat=sample_rates=48000:channel_layouts=stereo[background];\
+                       [1:a]aformat=sample_rates=48000:channel_layouts=stereo,asplit=2[voice_sc][voice_mix];\
+                       [background][voice_sc]sidechaincompress=threshold=0.015:ratio=12:attack=12:release=320[ducked];\
+                       [ducked][voice_mix]amix=inputs=2:duration=longest:normalize=0,loudnorm=I=-16:TP=-1.0:LRA=7[aout]"
+            .to_string(),
+        "mute" => "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,loudnorm=I=-16:TP=-1.0:LRA=7[aout]"
+            .to_string(),
+        _ => format!(
+            "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,asplit=2[voice_sc][voice_mix];\
+             {}volume=0.72[original_level];\
+             [original_level][voice_sc]sidechaincompress=threshold=0.015:ratio=18:attack=12:release=360[ducked];\
+             [ducked][voice_mix]amix=inputs=2:duration=longest:normalize=0,loudnorm=I=-16:TP=-1.0:LRA=7[aout]",
+            original_audio_label.unwrap_or("[0:a]")
+        ),
+    }
+}
+
+pub(crate) fn video_timeline_filter(map: &TimelineMap, edited: bool) -> (&'static str, String) {
+    if !edited {
+        return ("[0:v]", String::new());
+    }
+    let mut filter = String::new();
+    let mut video_inputs = String::new();
+    let mut count = 0;
+    for span in map.spans().iter().filter(|span| span.operation != "cut") {
+        let start = span.source_start_ms as f64 / 1000.0;
+        let end = span.source_end_ms as f64 / 1000.0;
+        let rate = if span.operation == "speed" {
+            span.rate
+        } else {
+            1.0
+        };
+        filter.push_str(&format!(
+            "[0:v]trim=start={start:.3}:end={end:.3},setpts=(PTS-STARTPTS)/{rate:.5}[v{count}];"
+        ));
+        video_inputs.push_str(&format!("[v{count}]"));
+        count += 1;
+    }
+    filter.push_str(&format!("{video_inputs}concat=n={count}:v=1:a=0[vtime];"));
+    ("[vtime]", filter)
 }
 
 pub(crate) fn media_timeline_filter(
@@ -571,6 +657,21 @@ fn fallback_dubbing_cues(segments: &[SegmentRecord]) -> Vec<DubbingCue> {
         .collect()
 }
 
+fn ensure_complete_dubbing_cues(
+    segments: &[SegmentRecord],
+    artifact_cues: Vec<DubbingCue>,
+) -> Vec<DubbingCue> {
+    let expected = segments
+        .iter()
+        .filter(|segment| !segment.spoken_zh.trim().is_empty())
+        .count();
+    if artifact_cues.len() == expected {
+        artifact_cues
+    } else {
+        fallback_dubbing_cues(segments)
+    }
+}
+
 fn dubbing_srt(cues: &[DubbingCue]) -> String {
     let mut out = String::new();
     for (index, cue) in cues.iter().enumerate() {
@@ -620,39 +721,6 @@ fn ass_time(ms: i64) -> String {
         (ms % 1000) / 10
     )
 }
-fn safe_name(s: &str) -> String {
-    s.chars()
-        .map(|c| if "/:\\".contains(c) { '_' } else { c })
-        .collect()
-}
-fn available_export_directory(output_root: &Path, project_name: &str) -> PathBuf {
-    let preferred = output_root.join(project_name);
-    if !preferred.exists() {
-        return preferred;
-    }
-    (2..)
-        .map(|version| output_root.join(format!("{project_name} ({version})")))
-        .find(|candidate| !candidate.exists())
-        .expect("export directory version space exhausted")
-}
-fn escape_filter_path(p: &Path) -> String {
-    p.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace(':', "\\:")
-        .replace('\'', "\\'")
-}
-fn ffmpeg() -> PathBuf {
-    [
-        "/opt/homebrew/bin/ffmpeg",
-        "/usr/local/bin/ffmpeg",
-        "/usr/bin/ffmpeg",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|p| p.is_file())
-    .unwrap_or_else(|| PathBuf::from("ffmpeg"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,6 +808,52 @@ mod tests {
     }
 
     #[test]
+    fn safe_and_mute_audio_filters_never_reference_the_original_track() {
+        let safe = export_audio_filter("separate", Some("[otime]"));
+        assert!(safe.contains("[2:a]"));
+        assert!(safe.contains("[1:a]"));
+        assert!(safe.contains("asplit=2[voice_sc][voice_mix]"));
+        assert!(safe.contains("[background][voice_sc]sidechaincompress"));
+        assert!(safe.contains("[ducked][voice_mix]amix"));
+        assert!(!safe.contains("[0:a]"));
+        assert!(!safe.contains("[otime]"));
+
+        let mute = export_audio_filter("mute", Some("[otime]"));
+        assert!(mute.contains("[1:a]"));
+        assert!(!mute.contains("[0:a]"));
+        assert!(!mute.contains("[otime]"));
+
+        let duck = export_audio_filter("duck", Some("[otime]"));
+        assert!(duck.contains("asplit=2[voice_sc][voice_mix]"));
+        assert!(duck.contains("[original_level][voice_sc]sidechaincompress"));
+        assert!(duck.contains("[ducked][voice_mix]amix"));
+    }
+
+    #[test]
+    fn safe_video_timeline_filter_does_not_decode_original_audio() {
+        let edit = TimelineEdit {
+            id: "cut-gap".into(),
+            project_id: "project".into(),
+            source_start_ms: 2_000,
+            source_end_ms: 4_000,
+            operation: "cut".into(),
+            rate: None,
+            output_duration_ms: 0,
+            origin: "user".into(),
+            reason: "test".into(),
+            confidence: 1.0,
+            accepted: true,
+            revision: 1,
+        };
+        let map = TimelineMap::from_edits(10_000, &[edit]).unwrap();
+        let (video, filter) = video_timeline_filter(&map, true);
+        assert_eq!(video, "[vtime]");
+        assert!(filter.contains("[0:v]trim=start=0.000:end=2.000"));
+        assert!(filter.contains("[0:v]trim=start=4.000:end=10.000"));
+        assert!(!filter.contains("[0:a]"));
+    }
+
+    #[test]
     fn parses_leading_internal_and_trailing_silences() {
         let log = r#"
 [silencedetect @ 0x1] silence_start: 0
@@ -798,6 +912,8 @@ mod tests {
         assert!(rendered.contains("自然口播的第一句"));
         assert!(rendered.contains("接着说第二句"));
         assert!(!rendered.contains("逐字翻译"));
+        let complete = ensure_complete_dubbing_cues(&[first, second], vec![cues[0].clone()]);
+        assert_eq!(complete.len(), 2);
     }
 
     #[test]
